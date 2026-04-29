@@ -7,15 +7,19 @@ from typing import Any, Dict, List, Tuple
 
 try:
 	import google.genai as genai
-	import numpy as np
 except ImportError as exc:
-	raise RuntimeError("Missing dependencies. Install with: pip install google-genai numpy") from exc
+	raise RuntimeError("Missing dependencies. Install with: pip install google-genai chromadb") from exc
+
+try:
+	from .chroma_store import DEFAULT_CHROMADB_DIR, get_available_documents as get_documents_from_store, search_articles as search_articles_from_store
+except ImportError:
+	from chroma_store import DEFAULT_CHROMADB_DIR, get_available_documents as get_documents_from_store, search_articles as search_articles_from_store
 
 
 DEFAULT_MODEL = "gemini-embedding-001"
 
 
-def _load_env_file(env_path: Path) -> None:
+
 	"""Load simple KEY=VALUE pairs from a local .env file into os.environ."""
 	if not env_path.exists():
 		return
@@ -40,116 +44,31 @@ def _resolve_api_key(cli_api_key: str | None) -> str:
 	return os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or ""
 
 
-def _iter_embedded_files(embedded_source: Path) -> List[Path]:
-	if embedded_source.is_file():
-		return [embedded_source]
-
-	embedded_files = sorted(
-		path
-		for path in embedded_source.rglob("*_embedded.json")
-		if path.is_file()
-	)
-	if embedded_files:
-		return embedded_files
-
-	return sorted(path for path in embedded_source.rglob("*.json") if path.is_file())
-
-
-def _iter_embedded_articles(embedded_source: Path):
-	for embedded_file in _iter_embedded_files(embedded_source):
-		with embedded_file.open("r", encoding="utf-8") as handle:
-			loaded_articles = json.load(handle)
-
-		if not isinstance(loaded_articles, list):
-			continue
-
-		for article in loaded_articles:
-			if not isinstance(article, dict):
-				continue
-
-			article_copy = dict(article)
-			article_copy["_embedded_file"] = str(embedded_file)
-			yield article_copy
-
-
-def _normalize_article_embedding(article_embedding: Any) -> List[float]:
-	if isinstance(article_embedding, dict) and "values" in article_embedding:
-		article_embedding = article_embedding["values"]
-
-	if isinstance(article_embedding, (list, tuple)) and len(article_embedding) > 0:
-		first_elem = article_embedding[0]
-		if isinstance(first_elem, (list, tuple)) and len(first_elem) == 2:
-			if first_elem[0] == "values" and isinstance(first_elem[1], (list, tuple)):
-				article_embedding = first_elem[1]
-
-	if isinstance(article_embedding, (list, tuple)):
-		return list(article_embedding)
-
-	raise RuntimeError(f"Unexpected embedding type: {type(article_embedding)}")
-
-
-def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-	"""
-	Calculate cosine similarity between two vectors.
-	
-	Args:
-		vec1: First embedding vector
-		vec2: Second embedding vector
-		
-	Returns:
-		Cosine similarity score (0 to 1)
-	"""
-	v1 = np.array(vec1, dtype=np.float32)
-	v2 = np.array(vec2, dtype=np.float32)
-	
-	norm1 = np.linalg.norm(v1)
-	norm2 = np.linalg.norm(v2)
-	
-	if norm1 == 0 or norm2 == 0:
-		return 0.0
-	
-	return float(np.dot(v1, v2) / (norm1 * norm2))
+def get_available_documents(embedded_source: Path) -> Dict[str, str]:
+	return get_documents_from_store(embedded_source, chromadb_dir=DEFAULT_CHROMADB_DIR)
 
 
 def embed_query(query: str, api_key: str, model: str = DEFAULT_MODEL) -> List[float]:
-	"""
-	Generate embedding for a query text.
-	
-	Args:
-		query: Query text to embed
-		api_key: Google API key
-		model: Embedding model name
-		
-	Returns:
-		Embedding vector (list of floats)
-	"""
 	if not query or not query.strip():
 		raise ValueError("Query cannot be empty")
-	
+
 	client = genai.Client(api_key=api_key)
-	
+
 	try:
 		response = client.models.embed_content(
 			model=f"models/{model}" if not model.startswith("models/") else model,
-			contents=query
+			contents=query,
 		)
-		
-		# Extract embedding from response
 		if response.embeddings and len(response.embeddings) > 0:
 			embedding = response.embeddings[0]
-			
-			# ContentEmbedding object has .values attribute
-			if hasattr(embedding, 'values'):
+			if hasattr(embedding, "values"):
 				return list(embedding.values)
-			elif isinstance(embedding, (list, tuple)):
+			if isinstance(embedding, (list, tuple)):
 				return list(embedding)
-			else:
-				raise RuntimeError(f"Unexpected embedding type: {type(embedding)}")
-		else:
-			raise RuntimeError("No embedding returned")
-			
-	except Exception as e:
-		raise RuntimeError(f"Error embedding query: {e}")
+			raise RuntimeError(f"Unexpected embedding type: {type(embedding)}")
+		raise RuntimeError("No embedding returned")
+	except Exception as exc:
+		raise RuntimeError(f"Error embedding query: {exc}")
 
 
 def search_articles(
@@ -158,69 +77,24 @@ def search_articles(
 	api_key: str,
 	model: str = DEFAULT_MODEL,
 	top_k: int = 5,
-	threshold: float = 0.0
+	threshold: float = 0.0,
+	document_filter: List[str] | None = None,
 ) -> List[Tuple[Dict[str, Any], float]]:
-	"""
-	Search articles by cosine similarity.
-	
-	Args:
-		embedded_file: Path to JSON file with embedded articles
-		query: Search query text
-		api_key: Google API key
-		model: Embedding model name
-		top_k: Number of top results to return
-		threshold: Minimum similarity score (0.0-1.0)
-		
-	Returns:
-		List of tuples (article, similarity_score) sorted by score descending
-	"""
-	print(f"Searching embedded articles from {embedded_file}")
-	
-	# Embed the query
-	print(f"Embedding query: {query[:100]}...")
 	query_embedding = embed_query(query, api_key, model)
-	print(f"Query embedding: {len(query_embedding)} dims")
-	
-	# Calculate similarities
-	results = []
-	article_count = 0
-	for i, article in enumerate(_iter_embedded_articles(embedded_file), 1):
-		article_count += 1
-		if not isinstance(article, dict):
-			continue
-		
-		# Get embedding from article
-		article_embedding = article.get("embedding")
-		if not article_embedding:
-			continue
-		
-		# Calculate cosine similarity
-		try:
-			article_embedding = _normalize_article_embedding(article_embedding)
-			similarity = cosine_similarity(query_embedding, article_embedding)
-		except Exception as e:
-			continue
-		
-		if similarity >= threshold:
-			results.append((article, similarity))
-		
-		if i % 100 == 0:
-			print(f"  Processed {i} articles...")
-	
-	# Sort by similarity descending
-	results.sort(key=lambda x: x[1], reverse=True)
-	print(f"Processed {article_count} embedded articles from {embedded_file}")
-	
-	return results[:top_k]
+	return search_articles_from_store(
+		embedded_file,
+		query_embedding,
+		top_k=top_k,
+		threshold=threshold,
+		document_filter=document_filter,
+		chromadb_dir=DEFAULT_CHROMADB_DIR,
+	)
 
 
 def format_result(article: Dict[str, Any], similarity: float, rank: int) -> str:
-	"""Format a search result for display."""
 	article_num = article.get("article_number") or article.get("article", "Unknown")
 	content = article.get("content", "")[:200]
 	embedded_file = article.get("_embedded_file", "")
-	
-	# Handle pages field - can be string like "158" or "158-159" or dict
 	pages = article.get("pages", "?")
 	if isinstance(pages, dict):
 		page_start = pages.get("start", "?")
@@ -228,11 +102,10 @@ def format_result(article: Dict[str, Any], similarity: float, rank: int) -> str:
 		pages_str = f"{page_start}-{page_end}"
 	else:
 		pages_str = str(pages) if pages else "?"
-	
-	# Only show content line if there's actual content
-	content_line = f"Content: {content}...\n" if content else ""
+
 	embedded_file_line = f"Embedded file: {embedded_file}\n" if embedded_file else ""
-	
+	content_line = f"Content: {content}...\n" if content else ""
+
 	return f"""\
 #{rank} - Similarity: {similarity:.4f} ({similarity*100:.2f}%)
 Article: {article_num}
@@ -240,86 +113,55 @@ Page(s): {pages_str}
 {embedded_file_line}{content_line}"""
 
 
-def main():
-	parser = argparse.ArgumentParser(
-		description="Search embedded articles using cosine similarity"
-	)
+def main() -> None:
+	parser = argparse.ArgumentParser(description="Search embedded articles using ChromaDB")
 	parser.add_argument(
 		"embedded_file",
 		type=Path,
-		help="Path to a JSON file or directory with embedded articles (from embed.py)"
+		help="Path to an embedded JSON file or directory (used to seed the ChromaDB index)",
 	)
-	parser.add_argument(
-		"-q", "--query",
-		default=None,
-		help="Search query text (if not provided, will prompt interactively)"
-	)
-	parser.add_argument(
-		"-k", "--top-k",
-		type=int,
-		default=5,
-		help="Number of top results to return (default: 5)"
-	)
-	parser.add_argument(
-		"-t", "--threshold",
-		type=float,
-		default=0.0,
-		help="Minimum similarity score 0.0-1.0 (default: 0.0)"
-	)
-	parser.add_argument(
-		"-a", "--api-key",
-		default=None,
-		help="Google API key (or set GOOGLE_API_KEY / GEMINI_API_KEY in .env)"
-	)
-	parser.add_argument(
-		"-m", "--model",
-		default=DEFAULT_MODEL,
-		help=f"Embedding model name (default: {DEFAULT_MODEL})"
-	)
-	
+	parser.add_argument("-q", "--query", default=None, help="Search query text (if not provided, will prompt interactively)")
+	parser.add_argument("-k", "--top-k", type=int, default=5, help="Number of top results to return (default: 5)")
+	parser.add_argument("-t", "--threshold", type=float, default=0.0, help="Minimum similarity score 0.0-1.0 (default: 0.0)")
+	parser.add_argument("-a", "--api-key", default=None, help="Google API key (or set GOOGLE_API_KEY / GEMINI_API_KEY in .env)")
+	parser.add_argument("-m", "--model", default=DEFAULT_MODEL, help=f"Embedding model name (default: {DEFAULT_MODEL})")
+
 	args = parser.parse_args()
-	
-	# Validate input file
 	embedded_file = args.embedded_file.resolve()
 	if not embedded_file.exists():
 		print(f"Error: File not found: {embedded_file}", file=sys.stderr)
 		sys.exit(1)
-	
-	# Get API key
+
 	_load_env_file(Path.cwd() / ".env")
 	api_key = _resolve_api_key(args.api_key)
 	if not api_key:
 		print("Error: Google API key required. Use --api-key or set GOOGLE_API_KEY / GEMINI_API_KEY in .env", file=sys.stderr)
 		sys.exit(1)
-	
-	# Get query
+
 	query = args.query
 	if not query:
 		print("Enter your search query (or 'quit' to exit):")
 		query = input("> ").strip()
 		if query.lower() == "quit":
 			sys.exit(0)
-	
+
 	if not query:
 		print("Error: Empty query", file=sys.stderr)
 		sys.exit(1)
-	
-	# Search
-	print(f"\nSearching with top_k={args.top_k}, threshold={args.threshold}\n")
+
 	results = search_articles(
 		embedded_file,
 		query,
 		api_key,
 		args.model,
 		args.top_k,
-		args.threshold
+		args.threshold,
 	)
-	
-	# Display results
+
 	if not results:
 		print(f"No results found with similarity >= {args.threshold}")
 		return
-	
+
 	print(f"\nFound {len(results)} result(s):\n")
 	for rank, (article, similarity) in enumerate(results, 1):
 		print(format_result(article, similarity, rank))
@@ -328,3 +170,4 @@ def main():
 
 if __name__ == "__main__":
 	main()
+			raise RuntimeError("No embedding returned")

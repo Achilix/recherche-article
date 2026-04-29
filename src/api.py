@@ -14,9 +14,9 @@ except ImportError:
 	genai = None
 
 try:
-	from .recherche import DEFAULT_MODEL, _iter_embedded_files, _load_env_file, _resolve_api_key, search_articles
+	from .recherche import DEFAULT_MODEL, _load_env_file, _resolve_api_key, search_articles, get_available_documents
 except ImportError:
-	from recherche import DEFAULT_MODEL, _iter_embedded_files, _load_env_file, _resolve_api_key, search_articles
+	from recherche import DEFAULT_MODEL, _load_env_file, _resolve_api_key, search_articles, get_available_documents
 
 
 _load_env_file(Path.cwd() / ".env")
@@ -24,7 +24,7 @@ _load_env_file(Path.cwd() / ".env")
 EMBEDDINGS_SOURCE = Path(os.environ.get("EMBEDDINGS_DIR", "output/embeddings")).resolve()
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
-DEFAULT_VERIFY_MODEL = "gemini-2.0-flash"
+DEFAULT_VERIFY_MODEL = "gemini-2.5-flash"
 
 CLOSE_FILTER_THRESHOLDS = {
 	"off": 0.0,
@@ -474,6 +474,15 @@ def _parse_search_request(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
 			return body_payload[key]
 		return _first_value(query_params, key, default)
 
+	# Handle documents filter - can be a list or comma-separated string
+	documents = _value("documents", None)
+	if documents is None:
+		documents = []
+	elif isinstance(documents, str):
+		documents = [d.strip() for d in documents.split(",") if d.strip()]
+	elif isinstance(documents, list):
+		documents = [str(d).strip() for d in documents if d]
+
 	return {
 		"query": _value("query", ""),
 		"top_k": _value("top_k", 5),
@@ -484,6 +493,7 @@ def _parse_search_request(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
 		"verify_model": _value("verify_model", DEFAULT_VERIFY_MODEL),
 		"model": _value("model", DEFAULT_MODEL),
 		"api_key": _value("api_key", ""),
+		"documents": documents,
 	}
 
 
@@ -538,6 +548,13 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 	def do_POST(self) -> None:
 		self._route()
 
+	def do_OPTIONS(self) -> None:
+		self.send_response(200)
+		self.send_header("Access-Control-Allow-Origin", "*")
+		self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		self.send_header("Access-Control-Allow-Headers", "Content-Type")
+		self.end_headers()
+
 	def _route(self) -> None:
 		parsed_url = urlparse(self.path)
 		if parsed_url.path in {"/", "/index.html"}:
@@ -548,14 +565,22 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 			self._handle_health()
 			return
 
+		if parsed_url.path == "/documents":
+			self._handle_documents()
+			return
+
 		if parsed_url.path == "/search":
 			self._handle_search()
+			return
+
+		if parsed_url.path == "/report":
+			self._handle_report()
 			return
 
 		_json_response(self, 404, {"error": "Not found"})
 
 	def _handle_health(self) -> None:
-		embedded_files = _iter_embedded_files(EMBEDDINGS_SOURCE) if EMBEDDINGS_SOURCE.exists() else []
+		embedded_files = list(EMBEDDINGS_SOURCE.rglob("*_embedded.json")) if EMBEDDINGS_SOURCE.exists() else []
 		_json_response(
 			self,
 			200,
@@ -575,10 +600,41 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 				"message": "Built-in UI removed. Use your React/Next frontend with this API.",
 				"endpoints": {
 					"health": "/health",
+					"documents": "/documents",
 					"search": "/search",
 				},
 			},
 		)
+
+	def _handle_documents(self) -> None:
+		"""Return list of available documents."""
+		if not EMBEDDINGS_SOURCE.exists():
+			_json_response(
+				self,
+				400,
+				{
+					"error": f"Embeddings source not found: {EMBEDDINGS_SOURCE}",
+				},
+			)
+			return
+
+		try:
+			documents = get_available_documents(EMBEDDINGS_SOURCE)
+			# Convert to list format for frontend
+			doc_list = [
+				{"id": doc_id, "name": display_name}
+				for doc_id, display_name in documents.items()
+			]
+			_json_response(
+				self,
+				200,
+				{
+					"documents": doc_list,
+					"count": len(doc_list),
+				},
+			)
+		except Exception as exc:
+			_json_response(self, 500, {"error": str(exc)})
 
 	def _handle_search(self) -> None:
 		if not EMBEDDINGS_SOURCE.exists():
@@ -625,6 +681,7 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 				str(params["model"]).strip() or DEFAULT_MODEL,
 				top_k,
 				effective_threshold,
+				params["documents"] if params["documents"] else None,
 			)
 
 			serialized_results = [
@@ -689,8 +746,67 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 			},
 		)
 
+	def _handle_report(self) -> None:
+		"""Generate a detailed report for provided articles using the configured LLM.
+		Request JSON: { "articles": [ { article_number, document_name, content, embedded_file } ], "title": "Optional report title", "api_key": "optional" }
+		Response JSON: { "report_html": "<div>...</div>" }
+		"""
+		if genai is None:
+			_json_response(self, 500, {"error": "google-genai library is required for report generation"})
+			return
+
+		try:
+			length = int(self.headers.get('Content-Length') or 0)
+			body = self.rfile.read(length).decode('utf-8') if length else '{}'
+			payload = json.loads(body)
+		except Exception as exc:
+			_json_response(self, 400, {"error": f"Invalid JSON body: {exc}"})
+			return
+
+		articles = payload.get('articles') or []
+		report_title = str(payload.get('title') or 'Generated Legal Report')
+		api_key = _resolve_api_key(str(payload.get('api_key') or '').strip() or None)
+		if not api_key:
+			_json_response(self, 400, {"error": "Google API key required. Set GOOGLE_API_KEY or GEMINI_API_KEY, or send api_key in the request."})
+			return
+
+		# Build a concise prompt with article summaries
+		candidates = []
+		for idx, a in enumerate(articles):
+			candidates.append({
+				"index": idx,
+				"article_number": a.get('article_number'),
+				"document_name": a.get('document_name'),
+				"content": str(a.get('content', ''))[:2000],
+			})
+
+		prompt = (
+			"You are an expert legal analyst. Produce a clear, well-structured HTML report that summarizes and analyzes the following legal passages. "
+			"For each passage include: a heading with the document name and article number, the passage excerpt, a short plain-language summary, potential legal implications, and suggested follow-up questions. "
+			"Keep the report professional and neutral. Return ONLY HTML inside a single <div>...</div> with reasonable semantic tags (h2, p, ul, li).\n\n"
+			f"Report title: {report_title}\n\nCandidates:\n{json.dumps(candidates, ensure_ascii=False)}"
+		)
+
+		try:
+			client = genai.Client(api_key=api_key)
+			response = client.models.generate_content(
+				model=f"models/{DEFAULT_VERIFY_MODEL}" if not DEFAULT_VERIFY_MODEL.startswith("models/") else DEFAULT_VERIFY_MODEL,
+				contents=prompt,
+			)
+			report_html = getattr(response, 'text', '') or ''
+			# Attempt to extract a single HTML div if the model returned extra text
+			start = report_html.find('<div')
+			end = report_html.rfind('</div>')
+			if start != -1 and end != -1 and end > start:
+				report_html = report_html[start:end+6]
+			_json_response(self, 200, {"report_html": report_html})
+			return
+		except Exception as exc:
+			_json_response(self, 500, {"error": f"Report generation failed: {exc}"})
+			return
+
 	def log_message(self, format: str, *args: Any) -> None:
-		return
+		print(f"[{self.client_address[0]}] {format % args}")
 
 
 def run_server() -> None:

@@ -7,6 +7,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+try:
+	from .chroma_store import sync_embedded_source_to_chromadb
+except ImportError:
+	from chroma_store import sync_embedded_source_to_chromadb
+
 from embed import DEFAULT_MODEL, embed_text, embed_texts
 
 
@@ -70,6 +75,14 @@ def _write_articles(output_path: Path, articles: List[Dict[str, Any]]) -> None:
 	with tmp_path.open("w", encoding="utf-8") as handle:
 		json.dump(articles, handle, ensure_ascii=False, indent=2)
 	tmp_path.replace(output_path)
+
+
+def _sync_output_to_chromadb(output_path: Path) -> None:
+	try:
+		synced_count = sync_embedded_source_to_chromadb(output_path)
+		print(f"Synced {synced_count} embedded article(s) to ChromaDB")
+	except Exception as exc:
+		print(f"Warning: Could not sync ChromaDB index: {exc}")
 
 
 def _write_json_atomic(path: Path, payload: Any) -> None:
@@ -258,6 +271,7 @@ def embed_missing_articles(
 
 	if missing == 0:
 		_write_articles(output_path, articles)
+		_sync_output_to_chromadb(output_path)
 		print(f"No missing embeddings. File written unchanged to {output_path}")
 		return
 
@@ -349,6 +363,7 @@ def embed_missing_articles(
 			time.sleep(pause_seconds)
 
 	_write_articles(output_path, articles)
+	_sync_output_to_chromadb(output_path)
 
 	if checkpoint_every > 0 and effective_checkpoint_dir is not None and last_checkpoint_index != processed_missing:
 		checkpoint_path = _write_missing_checkpoint(

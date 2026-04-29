@@ -1,0 +1,6 @@
+pandas
+pymupdf
+requests
+google-genai
+numpy
+chromadb

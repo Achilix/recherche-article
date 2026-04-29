@@ -11,6 +11,11 @@ try:
 except ImportError as exc:
 	raise RuntimeError("Missing google-genai. Install it with: pip install google-genai") from exc
 
+try:
+	from .chroma_store import sync_embedded_source_to_chromadb
+except ImportError:
+	from chroma_store import sync_embedded_source_to_chromadb
+
 
 DEFAULT_MODEL = "gemini-embedding-001"
 
@@ -318,6 +323,12 @@ def embed_articles(
 	output_path.parent.mkdir(parents=True, exist_ok=True)
 	with output_path.open("w", encoding="utf-8") as handle:
 		json.dump(embedded_articles, handle, ensure_ascii=False, indent=2)
+
+	try:
+		synced_count = sync_embedded_source_to_chromadb(output_path)
+		print(f"Synced {synced_count} embedded article(s) to ChromaDB")
+	except Exception as exc:
+		print(f"Warning: Could not sync ChromaDB index: {exc}")
 
 	if checkpoint_every > 0 and effective_checkpoint_dir is not None and last_checkpoint_index != len(articles):
 		checkpoint_path = _write_embedding_checkpoint(
