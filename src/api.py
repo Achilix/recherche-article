@@ -18,6 +18,25 @@ try:
 except ImportError:
 	from recherche import DEFAULT_MODEL, _load_env_file, _resolve_api_key, search_articles, get_available_documents
 
+try:
+	from .auth_store import (
+		authenticate_user,
+		decode_token_payload,
+		extract_bearer_token,
+		get_user_from_token,
+		issue_token_pair,
+		update_password,
+	)
+except ImportError:
+	from auth_store import (
+		authenticate_user,
+		decode_token_payload,
+		extract_bearer_token,
+		get_user_from_token,
+		issue_token_pair,
+		update_password,
+	)
+
 
 _load_env_file(Path.cwd() / ".env")
 
@@ -573,8 +592,32 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 			self._handle_search()
 			return
 
+		if parsed_url.path == "/api/auth/login":
+			self._handle_login()
+			return
+
+		if parsed_url.path == "/api/auth/logout":
+			self._handle_logout()
+			return
+
+		if parsed_url.path == "/api/auth/current_user":
+			self._handle_current_user()
+			return
+
+		if parsed_url.path == "/api/auth/change_password":
+			self._handle_change_password()
+			return
+
+		if parsed_url.path == "/api/auth/refresh_token":
+			self._handle_refresh_token()
+			return
+
 		if parsed_url.path == "/report":
 			self._handle_report()
+			return
+
+		if parsed_url.path == "/models":
+			self._handle_models()
 			return
 
 		_json_response(self, 404, {"error": "Not found"})
@@ -635,6 +678,92 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 			)
 		except Exception as exc:
 			_json_response(self, 500, {"error": str(exc)})
+
+	def _handle_login(self) -> None:
+		try:
+			payload = _read_json_body(self)
+			identifier = str(payload.get("username") or payload.get("email") or "").strip()
+			password = str(payload.get("password") or "")
+			user = authenticate_user(identifier, password)
+			access_token, refresh_token = issue_token_pair(user)
+			_json_response(
+				self,
+				200,
+				{
+					"token": access_token,
+					"refresh_token": refresh_token,
+					"user": user,
+					"firstLogin": bool(user.get("must_change_password", False)),
+				},
+			)
+		except ValueError as exc:
+			_json_response(self, 400, {"msg": str(exc), "error": str(exc)})
+		except Exception as exc:
+			_json_response(self, 500, {"msg": str(exc), "error": str(exc)})
+
+	def _handle_logout(self) -> None:
+		_json_response(self, 200, {"msg": "Logged out successfully"})
+
+	def _handle_current_user(self) -> None:
+		token = extract_bearer_token(self.headers.get("Authorization"))
+		if not token:
+			_json_response(self, 401, {"error": "Unauthorized"})
+			return
+
+		user = get_user_from_token(token)
+		if not user:
+			_json_response(self, 401, {"error": "Unauthorized"})
+			return
+
+		_json_response(self, 200, {"user": user})
+
+	def _handle_change_password(self) -> None:
+		token = extract_bearer_token(self.headers.get("Authorization"))
+		if not token:
+			_json_response(self, 401, {"error": "Unauthorized"})
+			return
+
+		user = get_user_from_token(token)
+		if not user:
+			_json_response(self, 401, {"error": "Unauthorized"})
+			return
+
+		try:
+			payload = _read_json_body(self)
+			current_password = str(payload.get("current_password") or "")
+			new_password = str(payload.get("new_password") or "")
+			update_password(int(user["id"]), current_password, new_password)
+			_json_response(self, 200, {"msg": "Password updated successfully"})
+		except ValueError as exc:
+			_json_response(self, 400, {"msg": str(exc), "error": str(exc)})
+		except Exception as exc:
+			_json_response(self, 500, {"msg": str(exc), "error": str(exc)})
+
+	def _handle_refresh_token(self) -> None:
+		token = extract_bearer_token(self.headers.get("Authorization"))
+		if not token:
+			try:
+				payload = _read_json_body(self)
+			except Exception:
+				payload = {}
+			token = str(payload.get("refresh_token") or "").strip()
+
+		if not token:
+			_json_response(self, 401, {"error": "Unauthorized"})
+			return
+
+		payload = decode_token_payload(token)
+		if not payload:
+			_json_response(self, 401, {"error": "Unauthorized"})
+			return
+
+		user = get_user_from_token(token)
+		if not user:
+			_json_response(self, 401, {"error": "Unauthorized"})
+			return
+
+		access_token, refresh_token = issue_token_pair(user)
+		_json_response(self, 200, {"token": access_token, "refresh_token": refresh_token, "user": user})
 
 	def _handle_search(self) -> None:
 		if not EMBEDDINGS_SOURCE.exists():
@@ -804,6 +933,15 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 		except Exception as exc:
 			_json_response(self, 500, {"error": f"Report generation failed: {exc}"})
 			return
+
+	def _handle_models(self) -> None:
+		"""Return available models for report generation.
+		Response JSON: { "models": [{ "name": "gemini-2.5-flash", "provider": "google" }] }
+		"""
+		models = [
+			{"name": "gemini-2.5-flash", "provider": "google", "display_name": "Gemini 2.5 Flash"},
+		]
+		_json_response(self, 200, {"models": models})
 
 	def log_message(self, format: str, *args: Any) -> None:
 		print(f"[{self.client_address[0]}] {format % args}")

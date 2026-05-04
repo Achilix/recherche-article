@@ -19,22 +19,22 @@ except ImportError:
 DEFAULT_MODEL = "gemini-embedding-001"
 
 
+def _load_env_file(env_path: Path) -> None:
+    """Load simple KEY=VALUE pairs from a local .env file into os.environ."""
+    if not env_path.exists():
+        return
 
-	"""Load simple KEY=VALUE pairs from a local .env file into os.environ."""
-	if not env_path.exists():
-		return
+    with env_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
 
-	with env_path.open("r", encoding="utf-8") as handle:
-		for raw_line in handle:
-			line = raw_line.strip()
-			if not line or line.startswith("#") or "=" not in line:
-				continue
-
-			key, value = line.split("=", 1)
-			key = key.strip()
-			value = value.strip().strip('"').strip("'")
-			if key and key not in os.environ:
-				os.environ[key] = value
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
 
 
 def _resolve_api_key(cli_api_key: str | None) -> str:
@@ -170,4 +170,4 @@ def main() -> None:
 
 if __name__ == "__main__":
 	main()
-			raise RuntimeError("No embedding returned")
+
