@@ -11,16 +11,21 @@ The frontend now lives in [frontend](frontend) (Next.js). The Python API no long
 - [src/semantic_chunk.py](src/semantic_chunk.py): semantic chunking pipeline
 - [src/embed.py](src/embed.py): generate embeddings
 - [src/embed_missing.py](src/embed_missing.py): backfill missing embeddings only
+- [src/generate_questions.py](src/generate_questions.py): generate study questions per article via Ollama
 - [src/recherche.py](src/recherche.py): CLI semantic search
 - [src/api.py](src/api.py): backend search API
 - [frontend](frontend): Next.js frontend
-- [output](output): generated artifacts
+- [output/extracted](output/extracted): extracted article JSON/CSV files
+- [output/with_ids](output/with_ids): articles with stable IDs
+- [output/embeddings](output/embeddings): embedded article vectors
+- [output/questions](output/questions): generated study questions
 - [pdfs](pdfs): source PDF files
 
 ## Requirements
 
 - Python 3.10+
 - Node.js 20+ (for frontend)
+- [Ollama](https://ollama.com) running locally (for question generation only)
 
 Install Python dependencies from project root:
 
@@ -36,10 +41,15 @@ Create [\.env](.env) in the repository root:
 GOOGLE_API_KEY=your_key_here
 ```
 
-Accepted API key names:
+Accepted Google API key names:
 
 - `GOOGLE_API_KEY`
 - `GEMINI_API_KEY`
+
+Ollama environment variables (optional, for question generation):
+
+- `OLLAMA_BASE_URL` — Ollama server URL (default: `http://localhost:11434`)
+- `OLLAMA_MODEL` — model name to use (default: `qwen2.5:latest`)
 
 Frontend API base URL template:
 
@@ -76,6 +86,27 @@ python src/embed.py output/extracted/codedecommerce_articles.json
 ```bash
 python src/embed_missing.py output/embeddings/codedecommerce_articles_embedded.json
 ```
+
+6. (Optional) Generate study questions via Ollama:
+
+```bash
+python src/generate_questions.py output/with_ids/codedecommerce_articles_with_ids.json
+```
+
+Requires Ollama running locally with the target model pulled (default: `qwen2.5:latest`).
+Outputs JSON and CSV to `output/questions/`.
+
+Optional flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output-dir DIR` | `output/questions` | Where to write output files |
+| `--model MODEL` | `qwen2.5:latest` | Ollama model to use |
+| `--questions-per-article N` | `10` | Questions generated per article |
+| `--min-total-questions N` | `100` | Minimum questions before stopping |
+| `--max-total-questions N` | `200` | Maximum questions per run |
+| `--pause-seconds N` | `0` | Pause between batches |
+| `--max-retries N` | `3` | Retries per article on failure |
 
 ## Run Backend API
 
@@ -159,5 +190,7 @@ python src/recherche.py output/embeddings -q "obligation d'ouvrir un compte"
 - `Google API key required`: verify [\.env](.env) has a valid key.
 - `Embeddings source not found`: check [output/embeddings](output/embeddings) or pass `--embeddings-dir`.
 - `429 RESOURCE_EXHAUSTED`: disable `verify_results` or retry later.
+- `Model 'qwen2.5:latest' was not found`: run `ollama pull qwen2.5` and ensure Ollama is running.
+- Ollama question generation stalls: increase `--pause-seconds` (e.g. `--pause-seconds 1`) to reduce request pressure.
 - PowerShell `curl` alias issues: use `curl.exe`.
 - API returns relative source file paths by design.
