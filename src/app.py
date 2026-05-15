@@ -15,6 +15,12 @@ TITRE_PATTERN = re.compile(r"(?im)^\s*(Titre\b[^\n\r]*)")
 CHAPITRE_PATTERN = re.compile(r"(?im)^\s*((?:C|H)HAPITRE\b[^\n\r]*)")
 SECTION_PATTERN = re.compile(r"(?im)^\s*(Section\b[^\n\r]*)")
 SOUS_SECTION_PATTERN = re.compile(r"(?im)^\s*(Sous(?:\s|-)?section\b[^\n\r]*)")
+# Pattern for unmarked subsection headers like "Saisie et vente des immeubles" or "Mesures d'exécution sur..."
+# Simplified pattern: just detect lines with procedural keywords (no length limit in pattern)
+# Length check is done in the function to avoid matching long body text
+UNMARKED_SUBSECTION_PATTERN = re.compile(
+	r"(?i)^\s*(?:saisie|vente|mesures|exécution|execution|recouvrement|revendication|restitution|distraction|remise|majorat|acompte).+$"
+)
 NUMBERED_SOUS_SECTION_PATTERN = re.compile(r"(?i)^\s*(\d{1,2})\s*[-–—]\s+(.+?)\s*$")
 FOOTNOTE_LINE_RE = re.compile(r"(?im)^\s*\d+\s*[-–—]\s*.*$")
 PAGE_NUMBER_LINE_RE = re.compile(r"^\s*[-–—]?\s*\d{1,4}\s*[-–—]?\s*$")
@@ -250,6 +256,9 @@ def _extract_page_structure(
 					if consumed_heading_lines >= 3:
 						break
 				hierarchy_events.append((line_cursor, "section", heading_value))
+			elif _is_unmarked_subsection_header(text):
+				# Detect implicit procedural subsection headers like "Saisie et vente des immeubles"
+				hierarchy_events.append((line_cursor, "sous_section", _normalize_heading(text)))
 
 			sous_section_inline = _extract_sous_section_from_line(text)
 			if sous_section_inline is not None:
@@ -857,12 +866,14 @@ def _is_probable_footnote_line(line: str) -> bool:
 
 	marker_match = re.match(r"^\s*(\d+)\s*[-–—]", line)
 	marker_number = int(marker_match.group(1)) if marker_match else 0
-	if marker_number >= 30:
-		return True
-
 	body = re.sub(r"^\s*\d+\s*[-–—]\s*", "", line).strip()
 	if not body:
 		return False
+
+	# Large numeric prefixes are usually footnotes, but not when the body is a
+	# citation continuation like "382-2000 du 15 mars 2000...".
+	if marker_number >= 30 and not re.match(r"^\s*\d", body):
+		return True
 
 	# Avoid stripping ordinary enumerations used in legal prose.
 	if re.match(r"(?i)^(?:l['’]|le\b|la\b|les\b|du\b|de\b|des\b)", body):
@@ -941,6 +952,37 @@ def _is_section_heading(
 
 	# Heading must start the line to avoid matching words inside paragraph content.
 	return _line_starts_with(text, "section")
+
+
+def _is_unmarked_subsection_header(text: str) -> bool:
+	"""Detect implicit subsection headers like 'Saisie et vente des immeubles'.
+	
+	These are unlabeled procedural section headers that should act as content
+	boundaries between articles. They typically describe execution/procedural methods.
+	Actual headers are relatively short (< 80 chars), not complex legal text.
+	"""
+	# Must be short - real headers are concise, body text is longer
+	if len(text) > 80 or len(text) < 10:
+		return False
+	
+	# Should not start with formal hierarchy markers
+	if re.match(r"(?i)^\s*(?:article|section|chapitre|titre|livre|sous)", text):
+		return False
+	
+	# Should not be all caps or all lowercase (likely body text)
+	if text.isupper() or text.islower():
+		return False
+	
+	# Should not contain commas (body text marker)
+	if ',' in text:
+		return False
+	
+	# Should match pattern like "Word et word des..."
+	# Common patterns: "Saisie et vente des X", "Mesures d'exécution sur X"
+	if UNMARKED_SUBSECTION_PATTERN.match(text):
+		return True
+	
+	return False
 
 
 def _is_chapitre_heading(

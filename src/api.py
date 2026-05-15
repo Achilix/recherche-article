@@ -37,6 +37,31 @@ except ImportError:
 		update_password,
 	)
 
+try:
+	from .llm_models_store import (
+		ensure_models_db,
+		get_models,
+		get_model,
+		get_active_models,
+		create_model,
+		update_model,
+		delete_model,
+		toggle_model_status,
+		ModelError,
+	)
+except ImportError:
+	from llm_models_store import (
+		ensure_models_db,
+		get_models,
+		get_model,
+		get_active_models,
+		create_model,
+		update_model,
+		delete_model,
+		toggle_model_status,
+		ModelError,
+	)
+
 
 _load_env_file(Path.cwd() / ".env")
 
@@ -44,6 +69,7 @@ EMBEDDINGS_SOURCE = Path(os.environ.get("EMBEDDINGS_DIR", "output/embeddings")).
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
 DEFAULT_VERIFY_MODEL = "gemini-2.5-flash"
+DEBUG_API = os.environ.get("API_DEBUG", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 CLOSE_FILTER_THRESHOLDS = {
 	"off": 0.0,
@@ -86,6 +112,14 @@ def _extract_json_object(text: str) -> str:
 	if start == -1 or end == -1 or end < start:
 		raise ValueError("Verification model did not return JSON")
 	return text[start : end + 1]
+
+
+def _debug_log(message: str, *args: Any) -> None:
+	if DEBUG_API:
+		if args:
+			print("[DEBUG] " + message.format(*args))
+		else:
+			print("[DEBUG] " + message)
 
 
 def _verify_results_with_gemini(
@@ -454,6 +488,13 @@ def _json_response(handler: BaseHTTPRequestHandler, status_code: int, payload: D
 	handler.wfile.write(body)
 
 
+def _cors_request_headers(handler: BaseHTTPRequestHandler) -> str:
+	requested_headers = handler.headers.get("Access-Control-Request-Headers", "")
+	if requested_headers:
+		return requested_headers
+	return "Authorization, Content-Type, Accept, Origin, X-Requested-With, X-Auth-Token"
+
+
 def _read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
 	content_length = int(handler.headers.get("Content-Length", "0") or 0)
 	if content_length <= 0:
@@ -487,6 +528,16 @@ def _parse_search_request(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
 
 	if handler.command == "POST":
 		body_payload = _read_json_body(handler)
+
+	_debug_log(
+		"Search request {} {} from {}",
+		handler.command,
+		parsed_url.path,
+		getattr(handler, "client_address", ("unknown", "unknown"))[0],
+	)
+	_debug_log("Search raw query params: {}", query_params)
+	if body_payload:
+		_debug_log("Search raw body payload keys: {}", sorted(body_payload.keys()))
 
 	def _value(key: str, default: Any = None) -> Any:
 		if key in body_payload:
@@ -557,8 +608,9 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 	def do_OPTIONS(self) -> None:
 		self.send_response(204)
 		self.send_header("Access-Control-Allow-Origin", "*")
-		self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		self.send_header("Access-Control-Allow-Headers", "Content-Type")
+		self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
+		self.send_header("Access-Control-Allow-Headers", _cors_request_headers(self))
+		self.send_header("Access-Control-Max-Age", "86400")
 		self.end_headers()
 
 	def do_GET(self) -> None:
@@ -567,18 +619,87 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 	def do_POST(self) -> None:
 		self._route()
 
-	def do_OPTIONS(self) -> None:
-		self.send_response(200)
-		self.send_header("Access-Control-Allow-Origin", "*")
-		self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		self.send_header("Access-Control-Allow-Headers", "Content-Type")
-		self.end_headers()
+	def do_PUT(self) -> None:
+		self._route()
+
+	def do_DELETE(self) -> None:
+		self._route()
+
+	def do_PATCH(self) -> None:
+		self._route()
 
 	def _route(self) -> None:
 		parsed_url = urlparse(self.path)
 		if parsed_url.path in {"/", "/index.html"}:
 			self._handle_root()
 			return
+		if parsed_url.path == "/health":
+			_json_response(self, 200, {"status": "ok"})
+			return
+		if parsed_url.path == "/documents":
+			self._handle_documents()
+			return
+		if parsed_url.path == "/search":
+			self._handle_search()
+			return
+		if parsed_url.path == "/api/auth/login":
+			self._handle_login()
+			return
+		if parsed_url.path == "/api/auth/logout":
+			self._handle_logout()
+			return
+		if parsed_url.path == "/api/auth/current_user":
+			self._handle_current_user()
+			return
+		if parsed_url.path == "/api/auth/change_password":
+			self._handle_change_password()
+			return
+		if parsed_url.path == "/api/auth/refresh_token":
+			self._handle_refresh_token()
+			return
+		if parsed_url.path == "/report":
+			self._handle_report()
+			return
+		if parsed_url.path == "/models":
+			self._handle_models()
+			return
+		# LLM Models API endpoints
+		if parsed_url.path == "/api/llm-models/active":
+			self._handle_llm_models_active()
+			return
+		if parsed_url.path.startswith("/api/llm-models/"):
+			path_parts = parsed_url.path.split("/")
+			if len(path_parts) >= 4:
+				try:
+					model_id = int(path_parts[3])
+					if len(path_parts) == 4:
+						# /api/llm-models/{id}
+						if self.command == "GET":
+							self._handle_get_llm_model(model_id)
+						elif self.command == "PUT":
+							self._handle_update_llm_model(model_id)
+						elif self.command == "DELETE":
+							self._handle_delete_llm_model(model_id)
+						else:
+							_json_response(self, 405, {"error": "Method not allowed"})
+						return
+					elif len(path_parts) == 5 and path_parts[4] == "toggle":
+						# /api/llm-models/{id}/toggle
+						if self.command == "PATCH":
+							self._handle_toggle_llm_model_status(model_id)
+							return
+				except (ValueError, IndexError):
+					pass
+		if parsed_url.path == "/api/llm-models":
+			if self.command == "GET":
+				self._handle_get_llm_models()
+			elif self.command == "POST":
+				self._handle_create_llm_model()
+			else:
+				_json_response(self, 405, {"error": "Method not allowed"})
+			return
+		_json_response(self, 404, {"error": "Not found"})
+		return
 
 		if parsed_url.path == "/health":
 			self._handle_health()
@@ -779,6 +900,17 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 		try:
 			params = _parse_search_request(self)
 			query = str(params["query"]).strip()
+			_debug_log(
+				"Parsed search params query={!r}, top_k={}, threshold={}, close_filter={!r}, verify_results={}, verify_top_n={}, verify_model={!r}, documents={}",
+				query,
+				params["top_k"],
+				params["threshold"],
+				params["close_filter"],
+				params["verify_results"],
+				params["verify_top_n"],
+				params["verify_model"],
+				params["documents"],
+			)
 			if not query:
 				raise ValueError("Query cannot be empty")
 
@@ -793,6 +925,12 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 			close_filter = str(params["close_filter"])
 			close_filter_threshold = _resolve_close_filter_threshold(close_filter)
 			effective_threshold = max(threshold, close_filter_threshold)
+			_debug_log(
+				"Thresholds threshold={} close_filter_threshold={} effective_threshold={}",
+				threshold,
+				close_filter_threshold,
+				effective_threshold,
+			)
 			verify_results = _to_bool(params["verify_results"])
 			verify_top_n = int(params["verify_top_n"])
 			if verify_top_n < 1:
@@ -812,6 +950,20 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 				effective_threshold,
 				params["documents"] if params["documents"] else None,
 			)
+			_debug_log("Primary search returned {} result(s)", len(results))
+
+			if not results and effective_threshold > 0.0:
+				_debug_log("Primary search empty; retrying with threshold=0.0 fallback")
+				results = search_articles(
+					EMBEDDINGS_SOURCE,
+					query,
+					api_key,
+					str(params["model"]).strip() or DEFAULT_MODEL,
+					top_k,
+					0.0,
+					params["documents"] if params["documents"] else None,
+				)
+				_debug_log("Fallback search returned {} result(s)", len(results))
 
 			serialized_results = [
 				_serialize_result(article, similarity)
@@ -846,12 +998,22 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 						"explanation": "AI verification unavailable; returning similarity-ranked results.",
 						"error": str(verify_exc),
 					}
+					_debug_log("AI verification failed: {}", verify_exc)
 		except ValueError as exc:
+			_debug_log("Search request rejected: {}", exc)
 			_json_response(self, 400, {"error": str(exc)})
 			return
 		except Exception as exc:
+			_debug_log("Search request failed: {}", exc)
 			_json_response(self, 500, {"error": str(exc)})
 			return
+
+		_debug_log(
+			"Search response result_count={} top_similarity={} verify_results={}",
+			len(results),
+			results[0][1] if results else 0.0,
+			verify_results,
+		)
 
 		_json_response(
 			self,
@@ -943,11 +1105,130 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 		]
 		_json_response(self, 200, {"models": models})
 
+	def _handle_get_llm_models(self) -> None:
+		"""GET /api/llm-models - List all LLM models"""
+		try:
+			ensure_models_db()
+			models = get_models()
+			_json_response(self, 200, models)
+		except Exception as exc:
+			_json_response(self, 500, {"error": f"Failed to retrieve models: {str(exc)}"})
+
+	def _handle_get_llm_model(self, model_id: int) -> None:
+		"""GET /api/llm-models/{id} - Get a specific LLM model"""
+		try:
+			model = get_model(model_id)
+			if not model:
+				_json_response(self, 404, {"error": f"Model with ID {model_id} not found"})
+				return
+			_json_response(self, 200, model)
+		except Exception as exc:
+			_json_response(self, 500, {"error": f"Failed to retrieve model: {str(exc)}"})
+
+	def _handle_create_llm_model(self) -> None:
+		"""POST /api/llm-models - Create a new LLM model"""
+		try:
+			payload = _read_json_body(self)
+			
+			name = str(payload.get("name", "")).strip()
+			provider = str(payload.get("provider", "")).strip().lower()
+			api_key = str(payload.get("api_key", "")).strip()
+			endpoint = str(payload.get("endpoint", "")).strip() if payload.get("endpoint") else None
+			temperature = float(payload.get("temperature", 0.7))
+			max_tokens = int(payload.get("max_tokens", 4000))
+			is_active = bool(payload.get("is_active", True))
+			
+			ensure_models_db()
+			model = create_model(
+				name=name,
+				provider=provider,
+				api_key=api_key,
+				endpoint=endpoint,
+				temperature=temperature,
+				max_tokens=max_tokens,
+				is_active=is_active
+			)
+			_json_response(self, 201, model)
+		except ModelError as exc:
+			_json_response(self, 400, {"error": str(exc)})
+		except ValueError as exc:
+			_json_response(self, 400, {"error": f"Invalid input: {str(exc)}"})
+		except Exception as exc:
+			_json_response(self, 500, {"error": f"Failed to create model: {str(exc)}"})
+
+	def _handle_update_llm_model(self, model_id: int) -> None:
+		"""PUT /api/llm-models/{id} - Update an LLM model"""
+		try:
+			payload = _read_json_body(self)
+			
+			update_data = {}
+			if "name" in payload:
+				update_data["name"] = payload["name"]
+			if "provider" in payload:
+				update_data["provider"] = payload["provider"]
+			if "api_key" in payload:
+				update_data["api_key"] = payload["api_key"]
+			if "endpoint" in payload:
+				update_data["endpoint"] = payload["endpoint"]
+			if "temperature" in payload:
+				update_data["temperature"] = payload["temperature"]
+			if "max_tokens" in payload:
+				update_data["max_tokens"] = payload["max_tokens"]
+			if "is_active" in payload:
+				update_data["is_active"] = payload["is_active"]
+			
+			ensure_models_db()
+			model = update_model(model_id, **update_data)
+			_json_response(self, 200, model)
+		except ModelError as exc:
+			_json_response(self, 400, {"error": str(exc)})
+		except ValueError as exc:
+			_json_response(self, 400, {"error": f"Invalid input: {str(exc)}"})
+		except Exception as exc:
+			_json_response(self, 500, {"error": f"Failed to update model: {str(exc)}"})
+
+	def _handle_delete_llm_model(self, model_id: int) -> None:
+		"""DELETE /api/llm-models/{id} - Delete an LLM model"""
+		try:
+			ensure_models_db()
+			result = delete_model(model_id)
+			if result:
+				_json_response(self, 204, {})
+			else:
+				_json_response(self, 404, {"error": f"Model with ID {model_id} not found"})
+		except ModelError as exc:
+			_json_response(self, 400, {"error": str(exc)})
+		except Exception as exc:
+			_json_response(self, 500, {"error": f"Failed to delete model: {str(exc)}"})
+
+	def _handle_toggle_llm_model_status(self, model_id: int) -> None:
+		"""PATCH /api/llm-models/{id}/toggle - Toggle model active status"""
+		try:
+			ensure_models_db()
+			model = toggle_model_status(model_id)
+			_json_response(self, 200, model)
+		except ModelError as exc:
+			_json_response(self, 400, {"error": str(exc)})
+		except Exception as exc:
+			_json_response(self, 500, {"error": f"Failed to toggle model status: {str(exc)}"})
+
+	def _handle_llm_models_active(self) -> None:
+		"""GET /api/llm-models/active - Get active models"""
+		try:
+			ensure_models_db()
+			models = get_active_models()
+			_json_response(self, 200, models)
+		except Exception as exc:
+			_json_response(self, 500, {"error": f"Failed to retrieve active models: {str(exc)}"})
+
 	def log_message(self, format: str, *args: Any) -> None:
 		print(f"[{self.client_address[0]}] {format % args}")
 
 
 def run_server() -> None:
+	# Initialize databases
+	ensure_models_db()
+	
 	server = ThreadingHTTPServer((HOST, PORT), SearchAPIHandler)
 	print(f"Search API listening on http://{HOST}:{PORT}")
 	print(f"Searching embedded files under: {EMBEDDINGS_SOURCE}")
