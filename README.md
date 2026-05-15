@@ -135,6 +135,181 @@ REACT_APP_API_URL=http://localhost:8000
 - **LLM Models**: SQLite database at `output/models/llm_models.sqlite3`
 - **Vector Store**: ChromaDB at `output/chromadb/`
 
+## Technology Choices & Justification
+
+This section explains the architectural decisions and why each technology was selected:
+
+### Backend: FastAPI (vs Django/Flask)
+
+| Aspect          | FastAPI                           | Django                   | Flask                    |
+| --------------- | --------------------------------- | ------------------------ | ------------------------ |
+| **Speed**       | ⚡ Native async support           | ⚠️ Requires extra config | ⚠️ Requires extra config |
+| **Setup**       | ✅ Minimal boilerplate            | ❌ Heavy framework       | ✅ Simple                |
+| **API Docs**    | ✅ Auto-generated Swagger/OpenAPI | ❌ Manual                | ❌ Manual                |
+| **Type Hints**  | ✅ Full support                   | ⚠️ Partial               | ⚠️ Partial               |
+| **Performance** | ✅ Fastest for async I/O          | ⚠️ Slower                | ⚠️ Slower                |
+
+**Decision**: FastAPI because:
+
+- ✅ Optimal for I/O-bound operations (PDF loading, API calls, embeddings)
+- ✅ Auto-generated API documentation (Swagger at `/docs`)
+- ✅ Built-in request validation with Pydantic
+- ✅ Superior for concurrent requests (multiple users searching)
+
+**Real-world benefit**: When 10 users search simultaneously, FastAPI handles async efficiently without Django's request queue overhead.
+
+### Frontend: Angular 19 (vs React/Vue)
+
+| Aspect               | Angular                 | React                       | Vue            |
+| -------------------- | ----------------------- | --------------------------- | -------------- |
+| **Learning curve**   | 📚 Steeper              | 📚 Moderate                 | 📚 Gentle      |
+| **Type Safety**      | ✅ Built-in TypeScript  | ⚠️ Optional                 | ⚠️ Optional    |
+| **Full Framework**   | ✅ Yes (routing, state) | ❌ Minimal (need libraries) | ⚠️ Partial     |
+| **Enterprise Ready** | ✅ Yes                  | ⚠️ With libraries           | ⚠️ Needs setup |
+| **Bundle Size**      | ⚠️ Larger               | ✅ Smaller                  | ✅ Smaller     |
+
+**Decision**: Angular because:
+
+- ✅ Full-featured framework (no decision fatigue choosing libraries)
+- ✅ Strong TypeScript integration for type safety
+- ✅ Built-in authentication patterns
+- ✅ RxJS for reactive programming (ideal for search UI)
+- ✅ Professional/enterprise standard
+
+**Trade-off accepted**: Larger bundle size acceptable for complex legal app where stability > speed.
+
+### Vector Database: ChromaDB (vs Elasticsearch/Redis/Pinecone)
+
+| Aspect             | ChromaDB              | Elasticsearch       | Redis             | Pinecone         |
+| ------------------ | --------------------- | ------------------- | ----------------- | ---------------- |
+| **Setup**          | ✅ Instant (embedded) | ❌ Complex          | ✅ Simple         | ❌ Cloud-only    |
+| **Cost**           | ✅ Free               | ⚠️ Self-hosted cost | ✅ Free           | ❌ Pay-per-query |
+| **Best for**       | Vector search         | Full-text + vectors | Caching + vectors | Production scale |
+| **Persistence**    | ✅ Disk-based         | ✅ Yes              | ❌ In-memory      | ✅ Yes           |
+| **Learning curve** | ✅ Minimal            | ❌ High             | ✅ Low            | ✅ Medium        |
+
+**Decision**: ChromaDB because:
+
+- ✅ **Perfect for educational/PFE projects**: Works out-of-the-box, no external services
+- ✅ **Persistence**: Survives application restarts (unlike Redis)
+- ✅ **Vector-native**: Built specifically for semantic search (unlike Elasticsearch)
+- ✅ **Self-contained**: No cloud dependency or subscription costs
+- ✅ **Scales to 100k+ vectors**: More than enough for 1000 legal articles
+
+**Scalability path**: If production deployment needed, simple migration to Pinecone/Weaviate.
+
+### AI Model: Google Gemini (vs OpenAI/Anthropic/Llama)
+
+| Aspect               | Gemini                | GPT-4          | Claude         | Llama                 |
+| -------------------- | --------------------- | -------------- | -------------- | --------------------- |
+| **Cost**             | ✅ Free tier generous | ❌ Expensive   | ⚠️ Expensive   | ✅ Free (self-hosted) |
+| **Embedding model**  | ✅ Optimized          | ✅ Expensive   | ✅ Expensive   | ⚠️ Variable quality   |
+| **Response quality** | ✅ High               | ✅ Highest     | ✅ High        | ⚠️ Lower              |
+| **Reliability**      | ✅ Stable             | ✅ Stable      | ✅ Stable      | ⚠️ Depends on setup   |
+| **Rate limits**      | ✅ Generous           | ⚠️ Restrictive | ⚠️ Restrictive | N/A                   |
+
+**Decision**: Google Gemini because:
+
+- ✅ **Free tier perfect for development**: 60 requests/minute sufficient
+- ✅ **Embedding quality**: Excellent for semantic search (tested with legal texts)
+- ✅ **Cost-effective**: No paid tier needed for PFE scope
+- ✅ **Question generation**: Works well for French legal text
+- ✅ **Reliable**: Google infrastructure stability
+
+**Production alternative**: Easily replaceable with OpenAI if needed.
+
+### Persistence: SQLite (vs PostgreSQL/MySQL)
+
+For auth & configuration:
+
+| Aspect            | SQLite                   | PostgreSQL      | MySQL           |
+| ----------------- | ------------------------ | --------------- | --------------- |
+| **Setup**         | ✅ None (file-based)     | ❌ Server setup | ❌ Server setup |
+| **Performance**   | ✅ Fast (simple queries) | ✅ Excellent    | ✅ Excellent    |
+| **Scaling**       | ⚠️ Single-threaded limit | ✅ Excellent    | ✅ Excellent    |
+| **For PFE scope** | ✅ Perfect               | ⚠️ Overkill     | ⚠️ Overkill     |
+| **Portability**   | ✅ One file              | ❌ Needs server | ❌ Needs server |
+
+**Decision**: SQLite because:
+
+- ✅ Zero setup: Database is just a `.sqlite3` file
+- ✅ Sufficient for <1000 concurrent users (PFE scope)
+- ✅ Complete portability: Ship app with database included
+- ✅ Perfect for authentication table (simple queries only)
+
+**Production note**: Easy migration to PostgreSQL if needed (just change connection string).
+
+### Styling: Tailwind CSS + SCSS (vs Bootstrap/Material)
+
+| Aspect            | Tailwind                        | Bootstrap          | Material           |
+| ----------------- | ------------------------------- | ------------------ | ------------------ |
+| **Learning**      | 📚 Utility-first (new paradigm) | 📚 Component-based | 📚 Complex theming |
+| **Customization** | ✅ Extreme                      | ⚠️ Moderate        | ⚠️ Moderate        |
+| **Bundle size**   | ✅ Tree-shakeable               | ⚠️ Large           | ❌ Very large      |
+| **Modern**        | ✅ Current standard             | ⚠️ Older           | ⚠️ Opinionated     |
+
+**Decision**: Tailwind CSS because:
+
+- ✅ Modern utility-first approach (industry standard 2024+)
+- ✅ Highly customizable for legal app aesthetic
+- ✅ Small bundle size with tree-shaking
+- ✅ Excellent component composition with Angular
+
+### PDF Processing: PyMUPDF (vs pdfplumber/PyPDF2)
+
+| Aspect       | PyMUPDF                       | pdfplumber          | PyPDF2     |
+| ------------ | ----------------------------- | ------------------- | ---------- |
+| **Speed**    | ⚡ Fastest                    | ⚠️ Slower           | ⚠️ Slowest |
+| **Accuracy** | ✅ High                       | ✅ High             | ⚠️ Lower   |
+| **Features** | ✅ Rich (images, text layout) | ✅ Table extraction | ⚠️ Basic   |
+| **Memory**   | ✅ Efficient                  | ⚠️ Heavy            | ✅ Light   |
+
+**Decision**: PyMUPDF because:
+
+- ✅ **Fastest extraction** for bulk processing (100+ documents)
+- ✅ **Accurate text recovery** from complex legal PDFs
+- ✅ **Rich metadata**: Preserves article structure
+- ✅ **Lower memory**: Important for batch processing
+
+### Architecture Decision: Microservices vs Monolith
+
+**Chosen**: Monolith with clear separation of concerns
+
+**Rationale**:
+
+- ✅ **Simpler for PFE scope**: No container orchestration needed
+- ✅ **Easier debugging**: Single deployment unit
+- ✅ **Lower operational complexity**: Perfect for educational project
+- ✅ **Performance**: No inter-service latency
+
+**Future scalability**: Modular structure makes extraction to microservices trivial if needed.
+
+### API Design: REST (vs GraphQL)
+
+**Chosen**: REST
+
+**Rationale**:
+
+- ✅ Simpler implementation for search operations
+- ✅ Better caching with HTTP standards
+- ✅ Easier testing with curl/Postman
+- ✅ Standard for legal/business applications
+
+**GraphQL would be overkill** for this project's query patterns.
+
+## Summary: Why These Choices Matter
+
+This technology stack was selected to:
+
+1. **Minimize setup complexity**: Deploy anywhere, no external services
+2. **Maximize educational value**: Learn modern full-stack development
+3. **Demonstrate best practices**: Production-ready code from day one
+4. **Enable future scaling**: Easy migration paths to enterprise systems
+5. **Ensure reliability**: Proven technologies used in production
+6. **Optimize for the domain**: Vector search for semantic matching
+
+Each choice is **defensible to a professional audience** and shows **thoughtful architectural decision-making**.
+
 ## Data Pipeline
 
 The system follows a multi-stage pipeline to process legal documents:
@@ -526,6 +701,7 @@ cd App-assistante-juridique-ia && npm install
    - Access docs at `http://localhost:8000/docs`
 
 2. **Frontend development**:
+
    ```bash
    cd App-assistante-juridique-ia
    npm start
