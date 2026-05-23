@@ -213,24 +213,27 @@ def get_available_documents(
 	chromadb_dir: Path = DEFAULT_CHROMADB_DIR,
 	collection_name: str = DEFAULT_COLLECTION_NAME,
 ) -> Dict[str, str]:
-	collection = ensure_chromadb_index(
-		embedded_source,
-		chromadb_dir=chromadb_dir,
-		collection_name=collection_name,
-	)
-	try:
-		payload = collection.get(include=["metadatas"])
-	except Exception:
-		payload = {"metadatas": []}
-
 	documents: Dict[str, str] = {}
-	for metadata in payload.get("metadatas", []) or []:
-		if not isinstance(metadata, dict):
-			continue
-		document_id = str(metadata.get("document_id") or "").strip()
+	for embedded_file in _iter_embedded_files(embedded_source):
+		document_id = _document_id_from_file(embedded_file)
 		if not document_id or document_id in documents:
 			continue
-		documents[document_id] = str(metadata.get("document_name") or document_id)
+
+		display_name = document_id
+		try:
+			with embedded_file.open("r", encoding="utf-8") as handle:
+				loaded_articles = json.load(handle)
+			if isinstance(loaded_articles, list):
+				for item in loaded_articles:
+					if isinstance(item, dict):
+						item_name = str(item.get("document_name") or "").strip()
+						if item_name:
+							display_name = item_name
+							break
+		except Exception:
+			pass
+
+		documents[document_id] = display_name
 
 	return dict(sorted(documents.items(), key=lambda item: item[1].lower()))
 

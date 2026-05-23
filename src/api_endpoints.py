@@ -87,6 +87,8 @@ def _find_model_by_name(model_name: str):
 def _call_llm_provider(model_config: dict, prompt: str, override_api_key: str = None) -> str:
 	"""Dispatch to provider-specific LLM calls. Returns text output or raises Exception."""
 	provider = (model_config.get('provider') or '').lower()
+	if provider == 'azure':
+		provider = 'azure-openai'
 	api_key = override_api_key or model_config.get('api_key') or os.environ.get('GOOGLE_API_KEY') or os.environ.get('OPENAI_API_KEY')
 	model_name = str(model_config.get('name') or '')
 

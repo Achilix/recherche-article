@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 import json
 import os
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -100,8 +101,10 @@ except ImportError:
 
 try:
 	from .api_endpoints import generate_report_backend, vectorize_report_backend, search_reports_backend
+	from .api_endpoints import _call_llm_provider
 except ImportError:
 	from api_endpoints import generate_report_backend, vectorize_report_backend, search_reports_backend
+	from api_endpoints import _call_llm_provider
 
 
 _load_env_file(Path.cwd() / ".env")
@@ -300,6 +303,73 @@ def _count_explicit_sent_to_expert_items(root: Path) -> int:
 	return total
 
 
+def _mark_question_sent_to_expert_in_payload(payload: Any, question_id: int) -> bool:
+	"""Update a question record in a JSON payload and return True when it was found."""
+	timestamp = datetime.utcnow().isoformat()
+
+	def _update_record(record: Any) -> bool:
+		if not isinstance(record, dict):
+			return False
+		record_id = record.get("id") or record.get("question_id")
+		try:
+			if int(record_id) != int(question_id):
+				return False
+		except Exception:
+			return False
+
+		record["status"] = "sent-to-expert"
+		record["sent_to_expert_at"] = timestamp
+		record["updated_at"] = timestamp
+		return True
+
+	if isinstance(payload, list):
+		return any(_update_record(item) for item in payload)
+
+	if isinstance(payload, dict):
+		if _update_record(payload):
+			return True
+		questions = payload.get("questions")
+		if isinstance(questions, list) and any(_update_record(item) for item in questions):
+			return True
+		for value in payload.values():
+			if isinstance(value, list) and any(_update_record(item) for item in value):
+				return True
+
+	return False
+
+
+def _write_json_atomic(path: Path, payload: Any) -> None:
+	path.parent.mkdir(parents=True, exist_ok=True)
+	tmp_path = path.with_suffix(path.suffix + ".tmp")
+	with tmp_path.open("w", encoding="utf-8") as handle:
+		json.dump(payload, handle, ensure_ascii=False, indent=2)
+	tmp_path.replace(path)
+
+
+def _mark_question_sent_to_expert_in_store(root: Path, question_id: int) -> bool:
+	"""Persist a sent-to-expert transition in the JSON question store."""
+	if not root.exists():
+		return False
+
+	for json_path in root.rglob("*.json"):
+		try:
+			with json_path.open("r", encoding="utf-8-sig") as handle:
+				payload = json.load(handle)
+		except Exception:
+			continue
+
+		if not _mark_question_sent_to_expert_in_payload(payload, question_id):
+			continue
+
+		try:
+			_write_json_atomic(json_path, payload)
+			return True
+		except Exception:
+			continue
+
+	return False
+
+
 def _build_dashboard_stats() -> Dict[str, Any]:
 	"""Build a dashboard payload compatible with the admin dashboard UI."""
 	if _use_postgres():
@@ -496,34 +566,184 @@ def _to_bool(value: Any) -> bool:
 	return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _verify_results_with_gemini(
+def _tokenize_verification_text(text: str) -> set[str]:
+	return {token for token in re.findall(r"[\wÀ-ÿ']+", (text or "").lower()) if len(token) > 2}
+
+
+def _find_model_config_by_name(model_name: str) -> Dict[str, Any] | None:
+	if not model_name:
+		return None
+	try:
+		models = get_models()
+	except Exception:
+		return None
+	requested = str(model_name).strip().lower()
+	for model in models:
+		name = str(model.get("name", "")).strip().lower()
+		if name == requested or name.endswith(requested):
+			return model
+	return None
+
+
+def _heuristic_verification(
+	query: str,
+	results: List[Dict[str, Any]],
+	verify_top_n: int,
+	verify_model: str,
+) -> Dict[str, Any]:
+	checked_results = results[: max(0, verify_top_n)]
+	query_tokens = _tokenize_verification_text(query)
+	verdicts: List[Dict[str, Any]] = []
+	relevant_count = 0
+
+	for index, result in enumerate(checked_results, start=1):
+		content_parts = [
+			str(result.get("document_name", "")),
+			str(result.get("content", "")),
+			str(result.get("article_number", "")),
+		]
+		content_text = " ".join(part for part in content_parts if part).lower()
+		content_tokens = _tokenize_verification_text(content_text)
+		overlap = sorted(query_tokens.intersection(content_tokens))
+		exact_match = query.strip().lower() in content_text if query.strip() else False
+		score = len(overlap) + (2 if exact_match else 0)
+		relevant = score > 0
+		if relevant:
+			relevant_count += 1
+		verdicts.append(
+			{
+				"index": index,
+				"relevant": relevant,
+				"confidence": min(1.0, 0.25 + (0.2 * len(overlap)) + (0.25 if exact_match else 0.0)),
+				"reason": (
+					"Heuristic overlap on: " + ", ".join(overlap)
+					if overlap
+					else ("Exact phrase match" if exact_match else "No strong overlap detected")
+				),
+				"document_name": result.get("document_name", ""),
+				"article_number": result.get("article_number", ""),
+				"similarity": result.get("similarity"),
+			},
+		)
+
+	if not checked_results:
+		overall = "not-run"
+		explanation = "No results were available to verify."
+	elif relevant_count == len(checked_results):
+		overall = "pass"
+		explanation = "All checked results overlap with the query according to heuristic verification."
+	elif relevant_count > 0:
+		overall = "partial"
+		explanation = "Some checked results overlap with the query, but not all of them are strongly supported."
+	else:
+		overall = "fail"
+		explanation = "No checked result showed a meaningful overlap with the query."
+
+	return {
+		"enabled": True,
+		"method": "heuristic",
+		"model": verify_model,
+		"checked_count": len(checked_results),
+		"relevant_count": relevant_count,
+		"overall": overall,
+		"explanation": explanation,
+		"verdicts": verdicts,
+	}
+
+
+def _parse_llm_verification_payload(text: str) -> Dict[str, Any] | None:
+	if not text:
+		return None
+	raw_text = text.strip()
+	if raw_text.startswith("```"):
+		raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+		raw_text = re.sub(r"\s*```$", "", raw_text)
+
+	try:
+		payload = json.loads(raw_text)
+	except json.JSONDecodeError:
+		match = re.search(r"\{.*\}", raw_text, re.S)
+		if not match:
+			return None
+		try:
+			payload = json.loads(match.group(0))
+		except json.JSONDecodeError:
+			return None
+
+	if not isinstance(payload, dict):
+		return None
+	return payload
+
+
+def _verify_results_with_model(
 	query: str,
 	results: List[Dict[str, Any]],
 	api_key: str,
 	verify_top_n: int,
 	verify_model: str,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-	if genai is None or not api_key:
-		return (
-			{
-				"enabled": False,
-				"model": verify_model,
-				"checked_count": 0,
-				"relevant_count": 0,
-				"overall": "not-run",
-				"explanation": "AI verification unavailable; returning similarity-ranked results.",
-			},
-			results,
-		)
-
 	checked_results = results[: max(0, verify_top_n)]
+	model_config = _find_model_config_by_name(verify_model)
+	resolved_model_name = verify_model
+	if model_config and model_config.get("name"):
+		resolved_model_name = str(model_config.get("name"))
+
+	if model_config is None:
+		model_config = {
+			"name": verify_model,
+			"provider": "gemini",
+			"api_key": api_key,
+		}
+
+	if genai is None and str(model_config.get("provider", "")).lower() == "gemini":
+		return _heuristic_verification(query, results, verify_top_n, resolved_model_name)
+
+	prompt = {
+		"query": query,
+		"instructions": [
+			"Evaluate whether each checked result answers the query.",
+			"Return only valid JSON with keys: overall, explanation, verdicts.",
+			"overall must be one of: pass, partial, fail.",
+			"Each verdict must include index, relevant, confidence, reason.",
+		],
+		"checked_results": checked_results,
+	}
+	verification_text = ""
+	try:
+		verification_text = _call_llm_provider(model_config, json.dumps(prompt, ensure_ascii=False), override_api_key=api_key)
+	except Exception as exc:
+		_debug_log("LLM verification failed, using heuristic fallback: {}", exc)
+		verification = _heuristic_verification(query, results, verify_top_n, resolved_model_name)
+		verification["error"] = str(exc)
+		return verification, results
+
+	payload = _parse_llm_verification_payload(verification_text)
+	if not payload:
+		verification = _heuristic_verification(query, results, verify_top_n, resolved_model_name)
+		verification["raw_model_output"] = verification_text[:4000]
+		verification["explanation"] = verification["explanation"] + " The model output could not be parsed, so a heuristic fallback was used."
+		return verification, results
+
+	verdicts = payload.get("verdicts") if isinstance(payload.get("verdicts"), list) else []
+	relevant_count = sum(1 for item in verdicts if isinstance(item, dict) and _to_bool(item.get("relevant")))
+	checked_count = len(checked_results)
+	overall = str(payload.get("overall") or "not-run").strip().lower()
+	if overall not in {"pass", "partial", "fail", "not-run"}:
+		overall = "not-run"
+	explanation = str(payload.get("explanation") or "").strip()
+	if not explanation:
+		explanation = "LLM verification completed successfully."
+
 	verification = {
 		"enabled": True,
-		"model": verify_model,
-		"checked_count": len(checked_results),
-		"relevant_count": len(checked_results),
-		"overall": "not-run",
-		"explanation": "AI verification is enabled, but this backend keeps the similarity-ranked results unchanged.",
+		"method": "llm",
+		"model": resolved_model_name,
+		"checked_count": checked_count,
+		"relevant_count": relevant_count,
+		"overall": overall,
+		"explanation": explanation,
+		"verdicts": verdicts,
+		"raw_model_output": verification_text[:4000],
 	}
 	return verification, results
 
@@ -663,6 +883,7 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 
 	def _route(self) -> None:
 		parsed_url = urlparse(self.path)
+		normalized_path = parsed_url.path.rstrip('/')
 		# Debug: print incoming request to terminal and also append to temp log
 		try:
 			print(f"[API] {datetime.utcnow().isoformat()} {self.client_address[0]} {self.command} {parsed_url.path}")
@@ -676,9 +897,9 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 		except Exception:
 			pass
 		# Quick early handling for question create endpoint to avoid routing issues
-		# Accept any POST path containing 'question' or ending with '/questions'
-		p_lower = parsed_url.path.lower() if isinstance(parsed_url.path, str) else ''
-		if self.command == "POST" and ("question" in p_lower or p_lower.rstrip("/").endswith("/questions") or p_lower == "/questions"):
+		# Only capture the exact create-question endpoints so per-question actions
+		# such as /send-to-expert can reach their dedicated handlers below.
+		if self.command == "POST" and normalized_path in {"/questions", "/api/question/questions"}:
 			try:
 				import tempfile
 				_tmp = Path(tempfile.gettempdir()) / "route_requests.log"
@@ -1203,9 +1424,11 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 				_json_response(self, 200, {"msg": "Question marked as sent to expert", "question_id": question_id})
 				return
 
-			# In a full implementation we'd locate the question by id and update persistence.
-			# For now, accept the request and return a success payload.
-			_json_response(self, 200, {"msg": "Question marked as sent to expert", "question_id": question_id})
+			if _mark_question_sent_to_expert_in_store(QUESTIONS_DIR, question_id):
+				_json_response(self, 200, {"msg": "Question marked as sent to expert", "question_id": question_id})
+				return
+
+			_json_response(self, 404, {"error": "Question not found"})
 		except Exception as exc:
 			_log_exception(self, exc)
 			_json_response(self, 500, {"error": str(exc)})
@@ -1479,7 +1702,7 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 
 			if verify_results and serialized_results:
 				try:
-					ai_verification, serialized_results = _verify_results_with_gemini(
+					ai_verification, serialized_results = _verify_results_with_model(
 						query,
 						serialized_results,
 						api_key,
@@ -1487,15 +1710,9 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 						verify_model,
 					)
 				except Exception as verify_exc:
-					ai_verification = {
-						"enabled": False,
-						"model": verify_model,
-						"checked_count": 0,
-						"relevant_count": 0,
-						"overall": "not-run",
-						"explanation": "AI verification unavailable; returning similarity-ranked results.",
-						"error": str(verify_exc),
-					}
+					ai_verification = _heuristic_verification(query, serialized_results, verify_top_n, verify_model)
+					ai_verification["enabled"] = True
+					ai_verification["error"] = str(verify_exc)
 					_debug_log("AI verification failed: {}", verify_exc)
 		except ValueError as exc:
 			_debug_log("Search request rejected: {}", exc)

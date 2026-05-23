@@ -45,6 +45,29 @@ ADMIN_SEED = {
 	"must_change_password": 0,
 }
 
+USER_SEEDS = [
+	{
+		"username": "user",
+		"email": "user@lex.local",
+		"firstname": "User",
+		"lastname": "Test",
+		"password": "User@12345!",
+		"role": "Utilisateur",
+		"is_blocked": 0,
+		"must_change_password": 0,
+	},
+	{
+		"username": "legal",
+		"email": "legal@lex.local",
+		"firstname": "Legal",
+		"lastname": "Manager",
+		"password": "Legal@12345!",
+		"role": "Responsable Juridique",
+		"is_blocked": 0,
+		"must_change_password": 0,
+	},
+]
+
 
 class AuthError(ValueError):
 	pass
@@ -102,36 +125,10 @@ def _ensure_auth_pg_schema(connection) -> None:
 		(ADMIN_SEED["username"], ADMIN_SEED["email"]),
 	).fetchone()
 	if admin_exists is None:
-		role_row = connection.execute(
-			"SELECT id FROM roles WHERE name = %s",
-			(ADMIN_SEED["role"],),
-		).fetchone()
-		if role_row is None:
-			raise RuntimeError("Unable to seed admin role")
-		salt_hex, hash_hex = _hash_password(ADMIN_SEED["password"])
-		now = _pg_now()
-		connection.execute(
-			"""
-			INSERT INTO users (
-				username, email, firstname, lastname,
-				password_salt, password_hash, role_id,
-				is_blocked, must_change_password, created_at, updated_at
-			) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-			""",
-			(
-				ADMIN_SEED["username"],
-				ADMIN_SEED["email"],
-				ADMIN_SEED["firstname"],
-				ADMIN_SEED["lastname"],
-				salt_hex,
-				hash_hex,
-				int(role_row["id"]),
-				bool(ADMIN_SEED["is_blocked"]),
-				bool(ADMIN_SEED["must_change_password"]),
-				now,
-				now,
-			),
-		)
+		_seed_user_pg(connection, ADMIN_SEED)
+
+	for seed_user in USER_SEEDS:
+		_seed_user_pg(connection, seed_user)
 
 
 def ensure_auth_db() -> None:
@@ -178,33 +175,10 @@ def ensure_auth_db() -> None:
 
 		cursor = connection.execute("SELECT id FROM users WHERE username = ? OR email = ?", (ADMIN_SEED["username"], ADMIN_SEED["email"]))
 		if cursor.fetchone() is None:
-			role_row = connection.execute("SELECT id FROM roles WHERE name = ?", (ADMIN_SEED["role"],)).fetchone()
-			if role_row is None:
-				raise RuntimeError("Unable to seed admin role")
-			salt_hex, hash_hex = _hash_password(ADMIN_SEED["password"])
-			now = int(time.time())
-			connection.execute(
-				"""
-				INSERT INTO users (
-					username, email, firstname, lastname,
-					password_salt, password_hash, role_id,
-					is_blocked, must_change_password, created_at, updated_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-				""",
-				(
-					ADMIN_SEED["username"],
-					ADMIN_SEED["email"],
-					ADMIN_SEED["firstname"],
-					ADMIN_SEED["lastname"],
-					salt_hex,
-					hash_hex,
-					int(role_row[0]),
-					ADMIN_SEED["is_blocked"],
-					ADMIN_SEED["must_change_password"],
-					now,
-					now,
-				),
-			)
+			_seed_user_sqlite(connection, ADMIN_SEED)
+
+		for seed_user in USER_SEEDS:
+			_seed_user_sqlite(connection, seed_user)
 
 		connection.commit()
 
@@ -870,6 +844,88 @@ def _row_to_user(row: sqlite3.Row) -> Dict[str, Any]:
 			"description": row["role_description"],
 		},
 	}
+
+
+def _seed_user_pg(connection, seed_user: Dict[str, Any]) -> None:
+	cursor = connection.execute(
+		"SELECT 1 FROM users WHERE username = %s OR email = %s",
+		(seed_user["username"], seed_user["email"]),
+	).fetchone()
+	if cursor is not None:
+		return
+
+	role_row = connection.execute(
+		"SELECT id FROM roles WHERE name = %s",
+		(seed_user["role"],),
+	).fetchone()
+	if role_row is None:
+		raise RuntimeError(f"Unable to seed role: {seed_user['role']}")
+
+	salt_hex, hash_hex = _hash_password(seed_user["password"])
+	now = _pg_now()
+	connection.execute(
+		"""
+		INSERT INTO users (
+			username, email, firstname, lastname,
+			password_salt, password_hash, role_id,
+			is_blocked, must_change_password, created_at, updated_at
+		) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+		""",
+		(
+			seed_user["username"],
+			seed_user["email"],
+			seed_user["firstname"],
+			seed_user["lastname"],
+			salt_hex,
+			hash_hex,
+			int(role_row["id"]),
+			bool(seed_user["is_blocked"]),
+			bool(seed_user["must_change_password"]),
+			now,
+			now,
+		),
+	)
+
+
+def _seed_user_sqlite(connection, seed_user: Dict[str, Any]) -> None:
+	cursor = connection.execute(
+		"SELECT 1 FROM users WHERE username = ? OR email = ?",
+		(seed_user["username"], seed_user["email"]),
+	).fetchone()
+	if cursor is not None:
+		return
+
+	role_row = connection.execute(
+		"SELECT id FROM roles WHERE name = ?",
+		(seed_user["role"],),
+	).fetchone()
+	if role_row is None:
+		raise RuntimeError(f"Unable to seed role: {seed_user['role']}")
+
+	salt_hex, hash_hex = _hash_password(seed_user["password"])
+	now = int(time.time())
+	connection.execute(
+		"""
+		INSERT INTO users (
+			username, email, firstname, lastname,
+			password_salt, password_hash, role_id,
+			is_blocked, must_change_password, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		""",
+		(
+			seed_user["username"],
+			seed_user["email"],
+			seed_user["firstname"],
+			seed_user["lastname"],
+			salt_hex,
+			hash_hex,
+			int(role_row[0]),
+			int(bool(seed_user["is_blocked"])),
+			int(bool(seed_user["must_change_password"])),
+			now,
+			now,
+		),
+	)
 
 
 def _create_token(user: Dict[str, Any], token_type: str, ttl_seconds: int) -> str:
