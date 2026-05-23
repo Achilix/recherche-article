@@ -8,17 +8,76 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 
+try:
+	import psycopg
+	from psycopg.rows import dict_row
+except ImportError:
+	psycopg = None
+	dict_row = None
+
 # Database configuration
 MODELS_DB_DIR = Path(os.environ.get("MODELS_DB_DIR", "output/models")).resolve()
 MODELS_DB_PATH = MODELS_DB_DIR / "llm_models.sqlite3"
+DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_DATABASE_URL") or ""
 
 
 class ModelError(ValueError):
 	pass
 
 
+def _use_postgres() -> bool:
+	return bool(DATABASE_URL.strip()) and psycopg is not None
+
+
+def _pg_connect():
+	if not _use_postgres():
+		raise RuntimeError("PostgreSQL is not configured")
+	return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+
+def _pg_now() -> datetime:
+	return datetime.now()
+
+
+def _ensure_models_pg_schema(connection) -> None:
+	connection.execute(
+		"""
+		CREATE TABLE IF NOT EXISTS llm_models (
+		  id bigserial PRIMARY KEY,
+		  name text NOT NULL UNIQUE,
+		  provider text NOT NULL,
+		  api_key text NOT NULL,
+		  endpoint text,
+		  temperature numeric(4,2) NOT NULL DEFAULT 0.7,
+		  max_tokens integer NOT NULL DEFAULT 4000,
+		  is_active boolean NOT NULL DEFAULT true,
+		  created_at timestamptz NOT NULL DEFAULT now(),
+		  updated_at timestamptz NOT NULL DEFAULT now()
+		)
+		"""
+	)
+	count_row = connection.execute("SELECT COUNT(*) AS total FROM llm_models").fetchone()
+	model_count = int(count_row["total"] or 0) if count_row else 0
+	if model_count == 0:
+		api_key = (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip()
+		if api_key:
+			connection.execute(
+				"""
+				INSERT INTO llm_models (name, provider, api_key, endpoint, temperature, max_tokens, is_active)
+				VALUES (%s, %s, %s, %s, %s, %s, %s)
+				""",
+				("gemini-2.5-flash", "gemini", api_key, None, 0.7, 4000, True),
+			)
+
+
 def ensure_models_db() -> None:
 	"""Ensure the models database exists and is initialized with schema."""
+	if _use_postgres():
+		with _pg_connect() as connection:
+			_ensure_models_pg_schema(connection)
+			connection.commit()
+		return
+
 	MODELS_DB_DIR.mkdir(parents=True, exist_ok=True)
 	
 	with sqlite3.connect(MODELS_DB_PATH) as connection:
@@ -37,11 +96,30 @@ def ensure_models_db() -> None:
 				updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 			);
 		""")
+
+		cursor = connection.execute("SELECT COUNT(*) FROM llm_models")
+		model_count = int(cursor.fetchone()[0] or 0)
+		if model_count == 0:
+			api_key = (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip()
+			if api_key:
+				connection.execute(
+					"""
+					INSERT INTO llm_models (name, provider, api_key, endpoint, temperature, max_tokens, is_active)
+					VALUES (?, ?, ?, ?, ?, ?, ?)
+					""",
+					("gemini-2.5-flash", "gemini", api_key, None, 0.7, 4000, 1),
+				)
 		connection.commit()
 
 
 def get_models() -> List[Dict[str, Any]]:
 	"""Retrieve all LLM models from database."""
+	if _use_postgres():
+		ensure_models_db()
+		with _pg_connect() as connection:
+			cursor = connection.execute("SELECT * FROM llm_models ORDER BY created_at DESC")
+			return [dict(row) for row in cursor.fetchall()]
+
 	ensure_models_db()
 	
 	with sqlite3.connect(MODELS_DB_PATH) as connection:
@@ -54,6 +132,13 @@ def get_models() -> List[Dict[str, Any]]:
 
 def get_model(model_id: int) -> Optional[Dict[str, Any]]:
 	"""Retrieve a specific LLM model by ID."""
+	if _use_postgres():
+		ensure_models_db()
+		with _pg_connect() as connection:
+			cursor = connection.execute("SELECT * FROM llm_models WHERE id = %s", (model_id,))
+			row = cursor.fetchone()
+		return dict(row) if row else None
+
 	ensure_models_db()
 	
 	with sqlite3.connect(MODELS_DB_PATH) as connection:
@@ -66,6 +151,14 @@ def get_model(model_id: int) -> Optional[Dict[str, Any]]:
 
 def get_active_models() -> List[Dict[str, str]]:
 	"""Retrieve all active models (name and provider only)."""
+	if _use_postgres():
+		ensure_models_db()
+		with _pg_connect() as connection:
+			cursor = connection.execute(
+				"SELECT name, provider FROM llm_models WHERE is_active = TRUE ORDER BY name"
+			)
+			return [dict(row) for row in cursor.fetchall()]
+
 	ensure_models_db()
 	
 	with sqlite3.connect(MODELS_DB_PATH) as connection:
@@ -81,6 +174,41 @@ def get_active_models() -> List[Dict[str, str]]:
 def create_model(name: str, provider: str, api_key: str, endpoint: Optional[str] = None,
 				 temperature: float = 0.7, max_tokens: int = 4000, is_active: bool = True) -> Dict[str, Any]:
 	"""Create a new LLM model."""
+	if _use_postgres():
+		ensure_models_db()
+		if not name or not name.strip():
+			raise ModelError("Model name is required")
+		if not provider or not provider.strip():
+			raise ModelError("Provider is required")
+		if not api_key or not api_key.strip():
+			raise ModelError("API key is required")
+
+		name = name.strip()
+		provider = provider.strip().lower()
+		valid_providers = ["openai", "gemini", "anthropic", "azure"]
+		if provider not in valid_providers:
+			raise ModelError(f"Provider must be one of: {', '.join(valid_providers)}")
+		if not 0 <= temperature <= 2:
+			raise ModelError("Temperature must be between 0 and 2")
+		if max_tokens < 1:
+			raise ModelError("Max tokens must be at least 1")
+
+		with _pg_connect() as connection:
+			cursor = connection.execute(
+				"""
+				INSERT INTO llm_models (name, provider, api_key, endpoint, temperature, max_tokens, is_active)
+				VALUES (%s, %s, %s, %s, %s, %s, %s)
+				RETURNING id
+				""",
+				(name, provider, api_key.strip(), endpoint, temperature, max_tokens, bool(is_active)),
+			)
+			connection.commit()
+			model_id = cursor.fetchone()[0]
+		model = get_model(int(model_id))
+		if not model:
+			raise ModelError("Failed to create model")
+		return model
+
 	ensure_models_db()
 	
 	# Validate required fields
@@ -132,6 +260,59 @@ def create_model(name: str, provider: str, api_key: str, endpoint: Optional[str]
 
 def update_model(model_id: int, **kwargs) -> Dict[str, Any]:
 	"""Update an existing LLM model."""
+	if _use_postgres():
+		ensure_models_db()
+		model = get_model(model_id)
+		if not model:
+			raise ModelError(f"Model with ID {model_id} not found")
+
+		allowed_fields = ["name", "provider", "api_key", "endpoint", "temperature", "max_tokens", "is_active"]
+		update_fields = {}
+		for field in allowed_fields:
+			if field in kwargs and kwargs[field] is not None:
+				value = kwargs[field]
+				if field == "name":
+					if not str(value).strip():
+						raise ModelError("Model name cannot be empty")
+					value = str(value).strip()
+				elif field == "provider":
+					provider = str(value).strip().lower()
+					valid_providers = ["openai", "gemini", "anthropic", "azure"]
+					if provider not in valid_providers:
+						raise ModelError(f"Provider must be one of: {', '.join(valid_providers)}")
+					value = provider
+				elif field == "api_key":
+					if not str(value).strip():
+						raise ModelError("API key cannot be empty")
+					value = str(value).strip()
+				elif field == "endpoint":
+					value = str(value).strip() if value else None
+				elif field == "temperature":
+					value = float(value)
+					if not 0 <= value <= 2:
+						raise ModelError("Temperature must be between 0 and 2")
+				elif field == "max_tokens":
+					value = int(value)
+					if value < 1:
+						raise ModelError("Max tokens must be at least 1")
+				elif field == "is_active":
+					value = bool(value)
+				update_fields[field] = value
+
+		if not update_fields:
+			return model
+
+		update_fields["updated_at"] = _pg_now()
+		set_clause = ", ".join([f"{key} = %s" for key in update_fields.keys()])
+		values = list(update_fields.values()) + [model_id]
+		with _pg_connect() as connection:
+			connection.execute(f"UPDATE llm_models SET {set_clause} WHERE id = %s", values)
+			connection.commit()
+		model = get_model(model_id)
+		if not model:
+			raise ModelError("Failed to update model")
+		return model
+
 	ensure_models_db()
 	
 	# Get existing model
@@ -207,6 +388,16 @@ def update_model(model_id: int, **kwargs) -> Dict[str, Any]:
 
 def delete_model(model_id: int) -> bool:
 	"""Delete an LLM model."""
+	if _use_postgres():
+		ensure_models_db()
+		model = get_model(model_id)
+		if not model:
+			raise ModelError(f"Model with ID {model_id} not found")
+		with _pg_connect() as connection:
+			cursor = connection.execute("DELETE FROM llm_models WHERE id = %s", (model_id,))
+			connection.commit()
+		return cursor.rowcount > 0
+
 	ensure_models_db()
 	
 	model = get_model(model_id)
@@ -222,6 +413,24 @@ def delete_model(model_id: int) -> bool:
 
 def toggle_model_status(model_id: int) -> Dict[str, Any]:
 	"""Toggle the active status of a model."""
+	if _use_postgres():
+		ensure_models_db()
+		model = get_model(model_id)
+		if not model:
+			raise ModelError(f"Model with ID {model_id} not found")
+
+		new_status = not bool(model["is_active"])
+		with _pg_connect() as connection:
+			connection.execute(
+				"UPDATE llm_models SET is_active = %s, updated_at = %s WHERE id = %s",
+				(new_status, _pg_now(), model_id),
+			)
+			connection.commit()
+		model = get_model(model_id)
+		if not model:
+			raise ModelError("Failed to toggle model status")
+		return model
+
 	ensure_models_db()
 	
 	model = get_model(model_id)

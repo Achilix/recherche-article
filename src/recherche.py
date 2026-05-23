@@ -52,11 +52,13 @@ def embed_query(query: str, api_key: str, model: str = DEFAULT_MODEL) -> List[fl
 	if not query or not query.strip():
 		raise ValueError("Query cannot be empty")
 
+	resolved_model = model if model and "embed" in model.lower() else DEFAULT_MODEL
+
 	client = genai.Client(api_key=api_key)
 
 	try:
 		response = client.models.embed_content(
-			model=f"models/{model}" if not model.startswith("models/") else model,
+			model=f"models/{resolved_model}" if not resolved_model.startswith("models/") else resolved_model,
 			contents=query,
 		)
 		if response.embeddings and len(response.embeddings) > 0:

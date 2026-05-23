@@ -4,3 +4,5 @@ requests
 google-genai
 numpy
 chromadb
+reportlab
+psycopg[binary]
