@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -398,6 +399,45 @@ def _resolve_role_id(connection: sqlite3.Connection, role_value: Any) -> int:
 	return int(row["id"])
 
 
+def _normalize_username_seed(value: str) -> str:
+	seed = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+	return seed or "user"
+
+
+def _username_exists(connection, username: str) -> bool:
+	if _use_postgres():
+		row = connection.execute("SELECT 1 FROM users WHERE LOWER(username) = LOWER(%s)", (username,)).fetchone()
+		return row is not None
+	row = connection.execute("SELECT 1 FROM users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone()
+	return row is not None
+
+
+def _generate_public_username(connection, firstname: str, lastname: str, email: str) -> str:
+	candidates: list[str] = []
+	email_local = (email.split("@", 1)[0] if "@" in email else "").strip()
+	if email_local:
+		candidates.append(_normalize_username_seed(email_local))
+	if firstname and lastname:
+		candidates.append(_normalize_username_seed(f"{firstname}.{lastname}"))
+	if firstname:
+		candidates.append(_normalize_username_seed(firstname))
+	if lastname:
+		candidates.append(_normalize_username_seed(lastname))
+
+	for candidate in candidates:
+		if candidate and not _username_exists(connection, candidate):
+			return candidate
+
+	base = candidates[0] if candidates else "user"
+	for _ in range(12):
+		suffix = secrets.token_hex(2)
+		candidate = f"{base}_{suffix}"
+		if not _username_exists(connection, candidate):
+			return candidate
+
+	raise AuthError("Unable to generate a unique username")
+
+
 def create_user(user_data: Dict[str, Any]) -> Dict[str, Any]:
 	if _use_postgres():
 		ensure_auth_db()
@@ -424,32 +464,37 @@ def create_user(user_data: Dict[str, Any]) -> Dict[str, Any]:
 			salt_hex, hash_hex = _hash_password(password)
 			is_blocked = bool(_to_bool(user_data.get("is_blocked")))
 			must_change_password = bool(_to_bool(user_data.get("must_change_password")))
-			cursor = connection.execute(
-				"""
-				INSERT INTO users (
-					username, email, firstname, lastname,
-					password_salt, password_hash, role_id,
-					is_blocked, must_change_password, created_at, updated_at
-				) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-				RETURNING id
-				""",
-				(
-					username,
-					email,
-					firstname,
-					lastname,
-					salt_hex,
-					hash_hex,
-					role_id,
-					is_blocked,
-					must_change_password,
-					now,
-					now,
-				),
-			)
-			connection.commit()
-			new_user_id = int(cursor.fetchone()[0])
-			return get_user_by_id(new_user_id) or {"id": new_user_id}
+			try:
+				cursor = connection.execute(
+					"""
+					INSERT INTO users (
+						username, email, firstname, lastname,
+						password_salt, password_hash, role_id,
+						is_blocked, must_change_password, created_at, updated_at
+					) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+					RETURNING id
+					""",
+					(
+						username,
+						email,
+						firstname,
+						lastname,
+						salt_hex,
+						hash_hex,
+						role_id,
+						is_blocked,
+						must_change_password,
+						now,
+						now,
+					),
+				)
+				connection.commit()
+				new_user_id = int(cursor.fetchone()[0])
+				return get_user_by_id(new_user_id) or {"id": new_user_id}
+			except Exception as exc:
+				if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
+					raise AuthError("Username or email already exists") from exc
+				raise
 
 	ensure_auth_db()
 	username = str(user_data.get("username") or "").strip()
@@ -497,8 +542,47 @@ def create_user(user_data: Dict[str, Any]) -> Dict[str, Any]:
 				now,
 			),
 		)
-		connection.commit()
-		return get_user_by_id(int(cursor.lastrowid)) or {"id": int(cursor.lastrowid)}
+		try:
+			connection.commit()
+			return get_user_by_id(int(cursor.lastrowid)) or {"id": int(cursor.lastrowid)}
+		except Exception as exc:
+			if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
+				raise AuthError("Username or email already exists") from exc
+			raise
+
+
+def register_public_user(registration_data: Dict[str, Any]) -> Dict[str, Any]:
+	firstname = str(registration_data.get("firstName") or registration_data.get("firstname") or "").strip()
+	lastname = str(registration_data.get("lastName") or registration_data.get("lastname") or "").strip()
+	email = str(registration_data.get("email") or "").strip()
+	password = str(registration_data.get("password") or "")
+	_ = str(registration_data.get("cabinetName") or registration_data.get("cabinet_name") or "").strip()
+
+	if not firstname:
+		raise AuthError("Firstname is required")
+	if not lastname:
+		raise AuthError("Lastname is required")
+	if not email:
+		raise AuthError("Email is required")
+	if not _is_strong_password(password):
+		raise AuthError("The password must contain at least 8 characters, one uppercase letter, one lowercase letter, and one number")
+
+	ensure_auth_db()
+	with _connect() as connection:
+		username = _generate_public_username(connection, firstname, lastname, email)
+
+	return create_user(
+		{
+			"username": username,
+			"email": email,
+			"firstname": firstname,
+			"lastname": lastname,
+			"password": password,
+			"role": "Utilisateur",
+			"is_blocked": 0,
+			"must_change_password": 0,
+		}
+	)
 
 
 def update_user(user_id: int, user_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -586,6 +670,17 @@ def update_user(user_id: int, user_data: Dict[str, Any]) -> Optional[Dict[str, A
 		connection.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", params)
 		connection.commit()
 		return get_user_by_id(user_id)
+
+
+def update_current_user_profile(user_id: int, profile_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+	profile_update = {
+		field: str(profile_data.get(field) or "").strip()
+		for field in ("email", "firstname", "lastname")
+		if str(profile_data.get(field) or "").strip()
+	}
+	if not profile_update:
+		raise AuthError("No updatable profile fields were provided")
+	return update_user(user_id, profile_update)
 
 
 def delete_user(user_id: int) -> bool:

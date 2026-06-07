@@ -47,6 +47,7 @@ try:
 		reset_user_password,
 		toggle_user_blocked_status,
 		update_password,
+		update_current_user_profile,
 		update_user,
 	)
 except ImportError:
@@ -66,6 +67,7 @@ except ImportError:
 		reset_user_password,
 		toggle_user_blocked_status,
 		update_password,
+		update_current_user_profile,
 		update_user,
 	)
 
@@ -169,21 +171,33 @@ def _postgres_history_items(status_filter: str | None = None, user_filter: str |
 	if not _use_postgres():
 		return []
 
-	query = "SELECT * FROM question_history_items"
-	clauses: list[str] = []
-	params: list[Any] = []
-	if user_filter:
-		clauses.append("CAST(COALESCE(user_identifier, '') AS text) = %s OR CAST(COALESCE(username, '') AS text) = %s OR CAST(COALESCE(user_id::text, '') AS text) = %s")
-		params.extend([user_filter, user_filter, user_filter])
-	if status_filter:
-		clauses.append("LOWER(COALESCE(status, '')) = LOWER(%s)")
-		params.append(status_filter)
-	if clauses:
-		query += " WHERE " + " AND ".join(f"({clause})" for clause in clauses)
-	query += " ORDER BY created_at DESC, id DESC"
+	query = "SELECT * FROM question_history_items ORDER BY created_at DESC, id DESC"
 	with _pg_connect() as connection:
-		rows = connection.execute(query, params).fetchall()
-		return [_pg_question_to_history_item(dict(row)) for row in rows]
+		rows = [dict(row) for row in connection.execute(query).fetchall()]
+
+	status_filter_norm = str(status_filter or "").strip().lower()
+	user_filter_norm = str(user_filter or "").strip()
+
+	filtered_rows: List[Dict[str, Any]] = []
+	for row in rows:
+		if status_filter_norm:
+			row_status = str(row.get("status") or "").strip().lower()
+			if row_status != status_filter_norm:
+				continue
+
+		if user_filter_norm:
+			candidates = [
+				str(row.get("user") or "").strip(),
+				str(row.get("user_identifier") or "").strip(),
+				str(row.get("username") or "").strip(),
+				str(row.get("user_id") or "").strip(),
+			]
+			if user_filter_norm not in candidates:
+				continue
+
+		filtered_rows.append(row)
+
+	return [_pg_question_to_history_item(row) for row in filtered_rows]
 
 
 def _postgres_dashboard_stats() -> Dict[str, Any]:
@@ -931,7 +945,12 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 			self._handle_logout()
 			return
 		if parsed_url.path == "/api/auth/current_user":
-			self._handle_current_user()
+			if self.command == "GET":
+				self._handle_current_user()
+			elif self.command in {"PUT", "PATCH"}:
+				self._handle_current_user_update()
+			else:
+				_json_response(self, 405, {"error": "Method not allowed"})
 			return
 		if parsed_url.path == "/api/dashboard/stats":
 			self._handle_dashboard_stats()
@@ -980,6 +999,9 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 			return
 		if parsed_url.path == "/api/question/questions/by-user-status":
 			self._handle_questions_by_user_status()
+			return
+		if parsed_url.path == "/api/question/questions/sent-to-expert":
+			self._handle_questions_sent_to_expert()
 			return
 		if parsed_url.path == "/api/question/questions/status/sent-to-expert":
 			self._handle_questions_sent_to_expert()
@@ -1091,7 +1113,7 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 			200,
 			{
 				"status": "ok",
-				"message": "Built-in UI removed. Use your React/Next frontend with this API.",
+				"message": "You have power over your mind - not outside events. Realize this, and you will find strength.",
 				"endpoints": {
 					"health": "/health",
 					"documents": "/documents",
@@ -1169,6 +1191,29 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 
 		_json_response(self, 200, {"user": user})
 
+	def _handle_current_user_update(self) -> None:
+		token = extract_bearer_token(self.headers.get("Authorization"))
+		if not token:
+			_json_response(self, 401, {"error": "Unauthorized"})
+			return
+
+		user = get_user_from_token(token)
+		if not user:
+			_json_response(self, 401, {"error": "Unauthorized"})
+			return
+
+		try:
+			payload = _read_json_body(self)
+			updated_user = update_current_user_profile(int(user["id"]), payload)
+			if updated_user is None:
+				_json_response(self, 404, {"error": "User not found"})
+				return
+			_json_response(self, 200, {"user": updated_user})
+		except AuthError as exc:
+			_json_response(self, 400, {"error": str(exc)})
+		except Exception as exc:
+			_json_response(self, 500, {"error": str(exc)})
+
 	def _handle_change_password(self) -> None:
 		token = extract_bearer_token(self.headers.get("Authorization"))
 		if not token:
@@ -1216,6 +1261,40 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 
 		access_token, refresh_token = issue_token_pair(user)
 		_json_response(self, 200, {"token": access_token, "refresh_token": refresh_token, "user": user})
+
+	def _require_authenticated_user(self) -> Dict[str, Any] | None:
+		token = extract_bearer_token(self.headers.get("Authorization"))
+		if not token:
+			_json_response(self, 401, {"error": "Unauthorized"})
+			return None
+
+		payload = decode_token_payload(token)
+		if not payload:
+			_json_response(self, 401, {"error": "Unauthorized"})
+			return None
+
+		user = get_user_from_token(token)
+		if user:
+			return user
+
+		try:
+			return {
+				"id": int(payload.get("sub")) if payload.get("sub") is not None else None,
+				"username": payload.get("username"),
+				"email": payload.get("email"),
+				"firstname": payload.get("firstname") or "",
+				"lastname": payload.get("lastname") or "",
+				"is_blocked": bool(payload.get("is_blocked", False)),
+				"must_change_password": bool(payload.get("must_change_password", False)),
+				"role": {
+					"id": int(payload.get("role_id")) if payload.get("role_id") is not None else None,
+					"name": payload.get("role") or payload.get("role_name") or "",
+					"description": "",
+				},
+			}
+		except Exception:
+			_json_response(self, 401, {"error": "Unauthorized"})
+			return None
 
 	def _require_admin_user(self) -> Dict[str, Any] | None:
 		token = extract_bearer_token(self.headers.get("Authorization"))
@@ -1278,12 +1357,26 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 
 	def _handle_questions_pagination(self) -> None:
 		"""Return paginated questions for all users with optional filters."""
+		request_user = self._require_authenticated_user()
+		if not request_user:
+			return
+
+		role_name = str((request_user.get("role") or {}).get("name") or "").strip().lower()
+		is_admin = role_name == "administrateur"
+		request_user_id = str(request_user.get("id") or "").strip()
+
 		parsed_url = urlparse(self.path)
 		query = parse_qs(parsed_url.query)
 		page = int(_first_value(query, 'page') or 1)
 		per_page = int(_first_value(query, 'per_page') or 10)
-		user_filter = _first_value(query, 'user')
+		user_filter = _first_value(query, 'user') or _first_value(query, 'user_id')
 		status_filter = _first_value(query, 'status')
+
+		if not is_admin:
+			if user_filter and request_user_id and str(user_filter) != request_user_id:
+				_json_response(self, 403, {"error": "Forbidden"})
+				return
+			user_filter = request_user_id
 
 		try:
 			if _use_postgres():
@@ -1326,16 +1419,30 @@ class SearchAPIHandler(BaseHTTPRequestHandler):
 			_json_response(self, 500, {"error": str(exc)})
 
 	def _handle_questions_by_user_status(self) -> None:
+		request_user = self._require_authenticated_user()
+		if not request_user:
+			return
+
+		role_name = str((request_user.get("role") or {}).get("name") or "").strip().lower()
+		is_admin = role_name == "administrateur"
+		request_user_id = str(request_user.get("id") or "").strip()
+
 		parsed_url = urlparse(self.path)
 		query = parse_qs(parsed_url.query)
 		page = int(_first_value(query, 'page') or 1)
 		per_page = int(_first_value(query, 'per_page') or 10)
-		user_filter = _first_value(query, 'user')
+		user_filter = _first_value(query, 'user') or _first_value(query, 'user_id')
 		status_filter = _first_value(query, 'status')
 
 		if not user_filter:
 			_json_response(self, 400, {"error": "Missing 'user' query parameter"})
 			return
+
+		if not is_admin:
+			if request_user_id and str(user_filter) != request_user_id:
+				_json_response(self, 403, {"error": "Forbidden"})
+				return
+			user_filter = request_user_id
 
 		try:
 			if _use_postgres():

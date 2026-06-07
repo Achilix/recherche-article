@@ -1,0 +1,64 @@
+2026-05-25T01:18:49.295059 PATH=/api/question/users/questions/pagination?page=1&per_page=10&user=2 ERROR=UndefinedColumn('column "user_identifier" does not exist\nLINE 1: ... FROM question_history_items WHERE (CAST(COALESCE(user_ident...\n                                                             ^')
+Traceback (most recent call last):
+  File "C:\Users\hatim\OneDrive\Desktop\project\src\api.py", line 1290, in _handle_questions_pagination
+    if role_name != "administrateur":
+              ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\hatim\OneDrive\Desktop\project\src\api.py", line 185, in _postgres_history_items
+    rows = connection.execute(query, params).fetchall()
+           ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "C:\Users\hatim\OneDrive\Desktop\project\.venv\Lib\site-packages\psycopg\connection.py", line 300, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.UndefinedColumn: column "user_identifier" does not exist
+LINE 1: ... FROM question_history_items WHERE (CAST(COALESCE(user_ident...
+                                                             ^
+
+2026-05-25T01:19:18.805047 PATH=/api/question/users/questions/pagination?page=1&per_page=10&user=2 ERROR=UndefinedColumn('column "user_identifier" does not exist\nLINE 1: ... FROM question_history_items WHERE (CAST(COALESCE(user_ident...\n                                                             ^')
+Traceback (most recent call last):
+  File "C:\Users\hatim\OneDrive\Desktop\project\src\api.py", line 1290, in _handle_questions_pagination
+    if role_name != "administrateur":
+              ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\hatim\OneDrive\Desktop\project\src\api.py", line 185, in _postgres_history_items
+    rows = connection.execute(query, params).fetchall()
+           ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "C:\Users\hatim\OneDrive\Desktop\project\.venv\Lib\site-packages\psycopg\connection.py", line 300, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.UndefinedColumn: column "user_identifier" does not exist
+LINE 1: ... FROM question_history_items WHERE (CAST(COALESCE(user_ident...
+                                                             ^
+
+2026-05-25T01:21:01.388901 PATH=/api/question/users/questions/pagination?page=1&per_page=10&user=2 ERROR=UndefinedColumn('column "user_identifier" does not exist\nLINE 1: ... FROM question_history_items WHERE (CAST(COALESCE(user_ident...\n                                                             ^')
+Traceback (most recent call last):
+  File "C:\Users\hatim\OneDrive\Desktop\project\src\api.py", line 1290, in _handle_questions_pagination
+    "must_change_password": bool(payload.get("must_change_password", False)),
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\hatim\OneDrive\Desktop\project\src\api.py", line 185, in _postgres_history_items
+  File "C:\Users\hatim\OneDrive\Desktop\project\.venv\Lib\site-packages\psycopg\connection.py", line 300, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.UndefinedColumn: column "user_identifier" does not exist
+LINE 1: ... FROM question_history_items WHERE (CAST(COALESCE(user_ident...
+                                                             ^
+
+2026-05-25T01:21:03.849846 PATH=/api/question/users/questions/pagination?page=1&per_page=10&user=2 ERROR=UndefinedColumn('column "user_identifier" does not exist\nLINE 1: ... FROM question_history_items WHERE (CAST(COALESCE(user_ident...\n                                                             ^')
+Traceback (most recent call last):
+  File "C:\Users\hatim\OneDrive\Desktop\project\src\api.py", line 1290, in _handle_questions_pagination
+    "must_change_password": bool(payload.get("must_change_password", False)),
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\hatim\OneDrive\Desktop\project\src\api.py", line 185, in _postgres_history_items
+  File "C:\Users\hatim\OneDrive\Desktop\project\.venv\Lib\site-packages\psycopg\connection.py", line 300, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.UndefinedColumn: column "user_identifier" does not exist
+LINE 1: ... FROM question_history_items WHERE (CAST(COALESCE(user_ident...
+                                                             ^
+
+2026-05-25T01:21:13.196103 PATH=/api/question/users/questions/pagination?page=1&per_page=10&user=2 ERROR=UndefinedColumn('column "user_identifier" does not exist\nLINE 1: ... FROM question_history_items WHERE (CAST(COALESCE(user_ident...\n                                                             ^')
+Traceback (most recent call last):
+  File "C:\Users\hatim\OneDrive\Desktop\project\src\api.py", line 1290, in _handle_questions_pagination
+    "must_change_password": bool(payload.get("must_change_password", False)),
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\hatim\OneDrive\Desktop\project\src\api.py", line 185, in _postgres_history_items
+  File "C:\Users\hatim\OneDrive\Desktop\project\.venv\Lib\site-packages\psycopg\connection.py", line 300, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.UndefinedColumn: column "user_identifier" does not exist
+LINE 1: ... FROM question_history_items WHERE (CAST(COALESCE(user_ident...
+                                                             ^
+
